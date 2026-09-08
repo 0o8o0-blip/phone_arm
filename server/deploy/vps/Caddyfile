@@ -1,0 +1,65 @@
+188-166-154-201.sslip.io {
+	# Static phone-controller assets served directly from the VPS. Sync via
+	# rsync from the follower on startup.
+	handle /static/* {
+		header Cache-Control "no-cache, no-store, must-revalidate"
+		header Pragma "no-cache"
+		header Expires "0"
+		root * /opt/phone_arm
+		file_server
+	}
+
+	# Root path -> operator index page. Matched via named matcher so it's
+	# EXACT, not the prefix "/" (which would swallow everything).
+	@root path /
+	handle @root {
+		header Cache-Control "no-cache, no-store, must-revalidate"
+		rewrite * /static/index.html
+		root * /opt/phone_arm
+		file_server
+	}
+
+	# MediaMTX WHIP/WHEP signaling. Auth is handled HERE, not by MediaMTX.
+	#
+	# Bearer tokens (not Basic auth), because the libsoup-based
+	# simple-whip-client sends URL user:pass@ but doesn't convert it into
+	# an Authorization header preemptively -- it only does so on a 401
+	# challenge (SoupAuth needs to be configured, which whip-client
+	# doesn't). Bearer tokens are sent as-is via its -t flag, unambiguously
+	# in the very first request.
+	#
+	# Tokens come from /etc/caddy/whip.env (chmod 640, root:caddy). The
+	# same tokens are the publisher/subscriber passwords generated on the
+	# Pi. MediaMTX is bound to 127.0.0.1:8889 and trusts loopback, so
+	# nothing external can bypass Caddy.
+	handle /robot/whip* {
+		@authed header Authorization "Bearer {env.WHIP_PUB_TOKEN}"
+		handle @authed {
+			reverse_proxy http://127.0.0.1:8889 {
+				# Don't leak the token to MediaMTX's logs.
+				header_up -Authorization
+			}
+		}
+		respond 401
+	}
+	handle /robot/whep* {
+		@authed header Authorization "Bearer {env.WHIP_SUB_TOKEN}"
+		handle @authed {
+			reverse_proxy http://127.0.0.1:8889 {
+				header_up -Authorization
+			}
+		}
+		respond 401
+	}
+
+	# Everything else (WebRTC signaling, /webrtc/config, /test_event, /healthz,
+	# /stats, /shutdown) proxies through the bore tunnel to the Pi's HTTPS
+	# server on localhost:8443.
+	handle {
+		reverse_proxy https://localhost:8443 {
+			transport http {
+				tls_insecure_skip_verify
+			}
+		}
+	}
+}

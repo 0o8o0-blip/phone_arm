@@ -1,0 +1,55 @@
+# --- MediaMTX config for phone_arm ---------------------------------------
+# One publisher (Pi camera) pushes H.264 via WHIP; the operator's phone
+# pulls via WHEP. RTSP/RTMP/HLS/SRT are disabled -- we don't use them.
+
+logLevel: info
+logDestinations: [stdout]
+readTimeout: 10s
+writeTimeout: 10s
+
+rtsp: no
+rtmp: no
+hls: no
+srt: no
+playback: no
+
+api: yes
+apiAddress: 127.0.0.1:9997
+metrics: no
+pprof: no
+
+webrtc: yes
+# WHIP/WHEP HTTP surface on loopback; Caddy proxies over TLS.
+webrtcAddress: 127.0.0.1:8889
+webrtcEncryption: no
+webrtcLocalUDPAddress: :8189
+# Advertise the droplet's PUBLIC IP in ICE candidates. Without this the
+# SFU would offer 10.16.0.5 (internal droplet IP), unroutable from phones.
+webrtcAdditionalHosts: [188.166.154.201]
+webrtcICEServers2:
+  - url: turn:188.166.154.201:3478?transport=udp
+    username: teleop
+    password: ${TURN_PW}
+
+# Auth is done at the Caddy layer (see server/deploy/vps/Caddyfile: basic_auth on
+# /robot/whip* and /robot/whep*). MediaMTX itself trusts anything coming
+# from loopback -- and it's bound to 127.0.0.1:8889 so nothing except
+# Caddy can reach it.
+#
+# Why not enforce here too: the libsoup-based simple-whip-client (and
+# gstreamer's future whipclientsink) doesn't convert URL user:pass@ into
+# a Basic Auth header, and MediaMTX's internal auth doesn't accept raw
+# Bearer tokens. Caddy is the correct place for HTTP auth anyway.
+authInternalUsers:
+  - user: any
+    pass:
+    ips: ['127.0.0.1/32', '::1/128']
+    permissions:
+      - action: publish
+      - action: read
+      - action: api
+
+paths:
+  robot:
+    source: publisher
+    record: no

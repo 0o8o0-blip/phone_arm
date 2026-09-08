@@ -1,0 +1,26 @@
+[Unit]
+Description=MediaMTX (WHIP/WHEP SFU for phone_arm robot video)
+Documentation=https://github.com/bluenviron/mediamtx
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/mediamtx
+# Passwords + TURN_PW live outside the unit so they're not visible in
+# `systemctl cat`. Chmod 600, owned by root.
+EnvironmentFile=/root/.mediamtx_secrets
+ExecStart=/opt/mediamtx/mediamtx /opt/mediamtx/mediamtx.yml
+Restart=on-failure
+RestartSec=3
+# Media plane is UDP -- give the process enough FD headroom for many
+# concurrent RTP streams even though we only expect 1-3.
+LimitNOFILE=65536
+# Log to journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mediamtx
+
+[Install]
+WantedBy=multi-user.target

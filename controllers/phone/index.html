@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#000">
+<title>Phone Arm — Controller</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; background: #000; color: #eee; font-family: -apple-system, system-ui, sans-serif; overflow: hidden; }
+
+  /* Landing screen (shown before XR session starts) */
+  #landing { position: fixed; inset: 0; display: flex; flex-direction: column; padding: 24px; gap: 16px; overflow-y: auto; }
+  #landing h1 { font-size: 22px; }
+  #landing p { font-size: 14px; line-height: 1.4; color: #aaa; }
+  #landing pre { font-size: 12px; background: #111; padding: 8px; border-radius: 6px; overflow-x: auto; color: #6cf; }
+  #mode-actions { margin-top: auto; display: grid; gap: 12px; }
+  #start-btn, #leader-btn { padding: 20px; border: none; border-radius: 12px; font-size: 19px; font-weight: 600; }
+  #start-btn { background: #2c8; color: #000; }
+  #leader-btn { background: #6cf; color: #00131c; }
+  #start-btn:disabled { background: #555; color: #888; }
+  #leader-panel { display: none; background: #111; border: 1px solid #345; border-radius: 10px; padding: 14px; gap: 10px; }
+  #leader-panel.show { display: grid; }
+  #leader-panel pre { user-select: text; -webkit-user-select: text; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #leader-panel button { padding: 12px; border: 0; border-radius: 8px; font-weight: 600; }
+  #copy-leader-btn { background: #6cf; color: #00131c; }
+  #watch-leader-btn { background: #333; color: #eee; }
+  #xr-support { font-size: 14px; padding: 12px; background: #111; border-radius: 8px; }
+  #xr-support.ok { color: #2c8; }
+  #xr-support.bad { color: #f55; }
+  #log { font-family: monospace; font-size: 11px; color: #888; height: 100px; overflow-y: auto; padding: 8px; background: #111; border-radius: 6px; }
+
+  /* DOM overlay during XR session */
+  #overlay { position: fixed; inset: 0; pointer-events: none; display: none; flex-direction: column; background: #000; }
+  #overlay.active { display: flex; }
+  #overlay > * { pointer-events: auto; }
+  #overlay.viewer #b1,
+  #overlay.viewer #bottom-bar { display: none; }
+  #overlay.viewer #status { top: 8px; }
+  /* Robot camera feed fills the overlay and hides WebXR phone-camera passthrough. */
+  #pi-cam {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; background: #000;
+    z-index: 0; pointer-events: none; display: none;
+  }
+  #pi-cam.active { display: block; }
+  #b1, #bottom-bar, #status { position: relative; z-index: 2; }
+  /* B1 fills the screen as a hold-to-enable touch zone. */
+  #b1 {
+    flex: 1;
+    margin: 12px;
+    background: transparent;
+    border: 2px solid rgba(44,200,136,0.45);
+    border-radius: 16px;
+    color: rgba(44,200,136,0.9);
+    font-size: 14px;
+    font-weight: 700;
+    text-align: center;
+    display: flex; align-items: flex-start; justify-content: center;
+    padding-top: 8px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+    touch-action: none;
+  }
+  #b1.held { background: rgba(40,200,140,0.18); border-color: rgba(40,200,140,0.95); }
+  /* B1 shows pressed-but-not-enabled in amber so the user can tell when the
+     server has gated their input. */
+  #b1.held.not-enabled { background: rgba(200,160,40,0.22); border-color: rgba(200,160,40,0.95); }
+
+  /* Status banner for "not enabled" reasons. Visible only when state != ok.
+     Moved OUT of screen-centre (was dead-centre, distracting) to a small pill
+     near the top, below the camera-switch row -- the edge-tint border still
+     conveys severity, this just names the reason without blocking the view. */
+  #banner {
+    position: absolute; top: 64px; left: 50%;
+    transform: translateX(-50%);
+    padding: 7px 14px; border-radius: 10px;
+    max-width: calc(100vw - 32px);
+    font-size: 15px; font-weight: 700; letter-spacing: 0.3px;
+    text-align: center; white-space: normal; line-height: 1.2;
+    pointer-events: none; z-index: 3;
+    display: none;
+  }
+  #banner.show { display: block; }
+  #banner.warn { background: rgba(220,160,40,0.92); color: #000; }
+  #banner.bad  { background: rgba(220,60,60,0.95); color: #fff; }
+
+  /* Tinted border around the whole overlay matches banner severity, so the
+     state is visible even if the user is looking at the bottom of the screen. */
+  #overlay.warn::before, #overlay.bad::before {
+    content: ''; position: absolute; inset: 0;
+    pointer-events: none; z-index: 2; border-radius: 12px;
+    box-shadow: inset 0 0 0 6px transparent;
+  }
+  #overlay.warn::before { box-shadow: inset 0 0 0 6px rgba(220,160,40,0.9); }
+  #overlay.bad::before  { box-shadow: inset 0 0 0 6px rgba(220,60,60,0.95); }
+  #bottom-bar { display: grid; grid-template-columns: 1fr; gap: 10px; margin: 0 12px 12px 12px; align-items: stretch; }
+  #follow-meter {
+    height: 46px;
+    background: rgba(0,0,0,0.58);
+    border: 1px solid rgba(255,255,255,0.24);
+    border-radius: 10px;
+    padding: 7px 10px;
+    pointer-events: none;
+    color: #eee;
+  }
+  #follow-label {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; font-size: 11px; font-weight: 800; letter-spacing: 0.4px;
+    line-height: 1;
+  }
+  #follow-value {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 14px; letter-spacing: 0; white-space: nowrap;
+  }
+  #follow-track {
+    height: 7px; margin-top: 7px; overflow: hidden;
+    background: rgba(255,255,255,0.18); border-radius: 4px;
+  }
+  #follow-fill {
+    height: 100%; width: 0%;
+    background: #2c8;
+    border-radius: inherit;
+    transition: width 120ms linear, background-color 120ms linear;
+  }
+  #follow-meter.idle { opacity: 0.65; }
+  #follow-meter.warn #follow-fill { background: #dc9f28; }
+  #follow-meter.bad #follow-fill { background: #dc3c3c; }
+  #follow-meter.stale #follow-fill { background: #777; }
+  #gripper-wrap { flex: 1; height: 80px; background: rgba(40,40,40,0.55); border-radius: 12px; padding: 8px; position: relative; touch-action: none; }
+  #gripper-wrap::before {
+    content: 'CLOSE';
+    position: absolute; top: 6px; left: 12px;
+    font-size: 11px; font-weight: 700; color: #aaa; pointer-events: none;
+  }
+  #gripper-wrap::after {
+    content: 'OPEN';
+    position: absolute; top: 6px; right: 12px;
+    font-size: 11px; font-weight: 700; color: #aaa; pointer-events: none;
+  }
+  #gripper-thumb {
+    position: absolute; top: 50%; transform: translate(-50%, -50%);
+    width: 56px; height: 56px; left: 50%;
+    background: #fc6; border-radius: 50%;
+  }
+  /* Stop button: relocated out of the bottom thumb-rest zone where accidental
+     touches kept ending the XR session. Now a small icon-button in the top
+     corner. */
+  #stop-btn {
+    position: absolute; top: 8px; right: 8px; z-index: 3;
+    width: 44px; height: 44px;
+    background: rgba(200,60,60,0.55); color: #fff;
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 22px;
+    font-size: 18px; font-weight: 700;
+    padding: 0; line-height: 1;
+  }
+  #status {
+    position: absolute; top: 30px; left: 8px;
+    background: rgba(0,0,0,0.55); padding: 6px 10px; border-radius: 6px;
+    font-family: monospace; font-size: 10px; line-height: 1.4; color: #ccc;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="landing">
+  <h1>Control this arm</h1>
+  <div id="xr-support">Checking WebXR support…</div>
+  <p>Choose one controller. Starting a leader arm replaces phone control for this one-to-one session.</p>
+  <div id="leader-panel">
+    <p>Run this on the computer with your leader arm. It will list the connected arms and ask which one to use.</p>
+    <pre id="leader-command">Loading command…</pre>
+    <button id="copy-leader-btn">Copy command</button>
+    <button id="watch-leader-btn">Watch robot video</button>
+  </div>
+  <div id="log"></div>
+  <div id="mode-actions">
+    <button id="start-btn" disabled>Control with phone</button>
+    <button id="leader-btn">Control with leader arm</button>
+  </div>
+</div>
+
+<div id="overlay">
+  <video id="pi-cam" autoplay muted playsinline></video>
+  <button id="stop-btn" aria-label="Stop AR session">✕</button>
+  <div id="b1" aria-label="B1 touch zone: hold or reengage to move the arm">B1<br><small>hold / reengage to move</small></div>
+  <div id="bottom-bar">
+    <div id="follow-meter" class="idle">
+      <div id="follow-label"><span>ROBOT GAP</span><strong id="follow-value">--</strong></div>
+      <div id="follow-track"><div id="follow-fill"></div></div>
+    </div>
+    <div id="gripper-wrap"><div id="gripper-thumb"></div></div>
+  </div>
+  <div id="status">connecting…</div>
+  <div id="banner"></div>
+</div>
+
+<script src="/static/app.js?v=20260907a"></script>
+</body>
+</html>

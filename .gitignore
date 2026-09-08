@@ -1,0 +1,23 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local backups / scratch
+*.bak
+/scratch/
+/.claude/
+
+# TLS material for the follower gateway (regenerated locally)
+/follower/certs/
+
+# Local robot test helpers
+/.lift_test.py
+/.pan_test.py
+/.hold_pos.py
+
+# Session recordings contain operator poses, robot trajectories and events.
+# Runtime output never belongs in source control.
+/teleop_recordings/
+
+# Local Android SDK.
+/.android-sdk/
