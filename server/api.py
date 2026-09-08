@@ -314,7 +314,7 @@ class SessionApi:
             "iceServers": [
                 self._turn_credentials(session, edge, capability_expiry)
             ],
-            "iceTransportPolicy": "all",
+            "iceTransportPolicy": "relay",
             "controlRole": "viewer",
             "controlTransport": "viewer",
             "mediamtxWhepUrl": f"{self.public_url}/media/{session}/whep",

@@ -366,8 +366,8 @@ const _controlTextDecoder = new TextDecoder();
 // log "operator commanded action X while looking at frame Y."
 let _displayedRtpTs = null;        // RTP timestamp of most recently displayed video frame
 let _tOpDisplayedMs = null;        // browser Date.now() at the moment that frame was scheduled to display
-// The hosted API prefers direct ICE to public MediaMTX and supplies TURN as a
-// fallback for restrictive networks. This initial value is replaced by config.
+// Hosted video is TURN-only so media follows the selected regional relay route.
+// This initial value is replaced by config, but intentionally matches it.
 let iceTransportPolicy = 'relay';
 
 function pollWebRTCStats() {
@@ -519,8 +519,8 @@ function updateRobotTrackingMeter() {
 // "POST an SDP offer, get an SDP answer" HTTP flow. Auth is a Bearer
 // token that Caddy validates before proxying to MediaMTX. The Pi is
 // not involved in video signaling at all in this path -- signaling
-// terminates on the VPS; media uses direct ICE when possible and TURN when
-// the operator network requires it.
+// terminates on the VPS; browser media is forced through the selected TURN
+// route for more predictable inter-region latency and jitter.
 async function startVideoWHEP(whepUrl, token, iceServers, policy) {
   let pc = null;
   try {

@@ -15,8 +15,8 @@ secrets, SSH keys, open ports or tunnels.
 
 The Singapore host at `146.190.104.81` runs a symmetric WebTransport edge and
 a second coturn instance. Robots and controllers independently select their
-nearest control edge. Browsers prefer direct media and receive both TURN
-servers as regional fallbacks, with the nearest one listed first.
+nearest control edge. Browser media is TURN-only and receives both regional
+servers with the nearest one listed first.
 
 ## Session model
 

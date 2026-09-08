@@ -19,6 +19,6 @@ After copying it, reload systemd and restart `phone-arm-wt-forwarder`.
 Singapore also runs coturn. It uses TURN REST authentication and the same
 server-only `static-auth-secret` as London. That secret is never copied to a
 robot or controller. The central API turns it into expiring credentials, and
-the browser tries the nearer TURN host first when a direct media path fails.
+the browser uses the nearer TURN host first for its relay-only media path.
 `turnserver.conf.template` records the safe, non-secret portion of this config;
 replace its placeholder only on the host and never commit the rendered file.
