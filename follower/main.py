@@ -17,7 +17,6 @@ patches are process-local (no on-disk lerobot mutation).
 from __future__ import annotations
 
 import faulthandler
-import glob
 import os
 import signal
 import subprocess
@@ -42,12 +41,7 @@ from lerobot.model.kinematics import RobotKinematics
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 import follower.gateway as _browser_phone_mod  # for access to _ACTIVE_RECORDER
-from follower.hardware import (
-    ROBOT_ADAPTER_SERIAL,
-    ROBOT_CALIBRATION_SERIAL,
-    ROBOT_ID,
-    ROBOT_PORT,
-)
+from follower.hardware import select_follower_arm
 from follower.gateway import BrowserPhone, PhoneConfig
 from follower.leader_mapping import RelativeLeaderMapper
 
@@ -111,46 +105,6 @@ class RobotProcessorPipeline:
         for step in self.steps:
             transition = step(transition)
         return self.to_output(transition)
-
-
-# --- Robot port resolution -------------------------------------------------
-# The follower's original USB adapter (5AE6084208) failed on 2026-09-06.
-# Its replacement has a new USB serial, but the servos and their calibration
-# are unchanged.  Keep these identities separate: the adapter serial selects
-# the device node, while ROBOT_SERIAL selects the existing calibration file.
-ROBOT_SERIAL = ROBOT_CALIBRATION_SERIAL
-DEFAULT_PORT = ROBOT_PORT
-
-
-def _udev_serial_for_port(port: str) -> str | None:
-    try:
-        out = subprocess.check_output(
-            ["udevadm", "info", "-q", "property", "-n", port],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    for line in out.splitlines():
-        if line.startswith("ID_SERIAL_SHORT="):
-            return line.split("=", 1)[1]
-    return None
-
-
-def _port_matches_robot(port: str) -> bool:
-    if not os.path.exists(port):
-        return False
-    return (
-        ROBOT_ADAPTER_SERIAL in os.path.basename(port)
-        or _udev_serial_for_port(port) == ROBOT_ADAPTER_SERIAL
-    )
-
-
-def _resolve_robot_port() -> str:
-    for port in [DEFAULT_PORT, *sorted(glob.glob("/dev/ttyACM*")), *sorted(glob.glob("/dev/ttyUSB*"))]:
-        if _port_matches_robot(port):
-            return port
-    raise RuntimeError(f"Could not find robot USB adapter serial {ROBOT_ADAPTER_SERIAL}")
 
 
 # --- Constants -------------------------------------------------------------
@@ -1790,7 +1744,7 @@ def _save_trajectory_csv(out_path: str | None = None) -> None:
     if out_path is None:
         out_path = os.environ.get(
             "PHONE_ARM_TRAJECTORY_CSV",
-            "/home/user/phone_arm_logs/teleop_trajectory.csv",
+            os.path.expanduser("~/phone_arm_logs/teleop_trajectory.csv"),
         )
     out_dir = os.path.dirname(out_path)
     if out_dir:
@@ -2066,9 +2020,9 @@ def _control_loop(
 
 # --- Main -----------------------------------------------------------------
 def main() -> None:
-    port = _resolve_robot_port()
-    print(f"[config] port={port} max_cmd_dps={MAX_CMD_DEG_PER_SEC:g}")
-    robot = SafeStartupSO101Follower(SO101FollowerConfig(port=port, id=ROBOT_ID, use_degrees=True))
+    port, robot_id = select_follower_arm()
+    print(f"[config] port={port} calibration={robot_id} max_cmd_dps={MAX_CMD_DEG_PER_SEC:g}")
+    robot = SafeStartupSO101Follower(SO101FollowerConfig(port=port, id=robot_id, use_degrees=True))
     teleop = BrowserPhone(PhoneConfig())
 
     # Connect robot BEFORE teleop so startup owns the serial bus exclusively.

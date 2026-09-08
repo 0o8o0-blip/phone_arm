@@ -3,9 +3,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+PYTHON_BIN="${PHONE_ARM_PYTHON:-$HOME/.venv/lerobot/bin/python}"
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "Follower Python environment not found: $PYTHON_BIN" >&2
+  echo "Set PHONE_ARM_PYTHON to the Python executable containing lerobot." >&2
+  exit 1
+fi
+
 # Preserve the prior log + trajectory CSV so we have forensics when a session
 # crashes, and so each run's data isn't clobbered by the next.
-LOG_DIR="${PHONE_ARM_LOG_DIR:-/home/user/phone_arm_logs}"
+LOG_DIR="${PHONE_ARM_LOG_DIR:-$HOME/phone_arm_logs}"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/teleop.log"
 TRAJ="$LOG_DIR/teleop_trajectory.csv"
@@ -58,7 +65,7 @@ _teleop_python_stats() {
     fi
     cmd=$(cat "$proc/cmdline" 2>/dev/null | tr '\0' ' ' || true)
     case "$cmd" in
-      *"/home/user/.venv/lerobot/bin/python"*) ;;
+      *"$PYTHON_BIN"*) ;;
       *) continue ;;
     esac
     pid=${proc##*/}
@@ -228,7 +235,7 @@ _start_whip_publisher_supervisor() {
 export PHONE_ARM_TURN_URL="${PHONE_ARM_TURN_URL:-turn:188.166.154.201:3478?transport=udp}"
 export PHONE_ARM_TURN_URL_PHONE="${PHONE_ARM_TURN_URL_PHONE:-turn:146.190.104.81:3478?transport=udp}"
 export PHONE_ARM_TURN_USER="${PHONE_ARM_TURN_USER:-teleop}"
-export PHONE_ARM_TURN_PW="${PHONE_ARM_TURN_PW:-$(cat /home/user/.turn_secret)}"
+export PHONE_ARM_TURN_PW="${PHONE_ARM_TURN_PW:-$(cat "$HOME/.turn_secret")}"
 
 # Control commands ride WebTransport datagrams via the session relay. The
 # relay keeps delivery latest-only and independent of the video/signaling
@@ -243,15 +250,15 @@ export PHONE_ARM_TURN_PW="${PHONE_ARM_TURN_PW:-$(cat /home/user/.turn_secret)}"
 export PHONE_ARM_SESSION_RELAY_WT_URL="${PHONE_ARM_SESSION_RELAY_WT_URL:-https://188-166-154-201.sslip.io:4433/wt}"
 export PHONE_ARM_SESSION_RELAY_WT_URL_PHONE="${PHONE_ARM_SESSION_RELAY_WT_URL_PHONE:-https://146-190-104-81.sslip.io:4434/wt}"
 export PHONE_ARM_SESSION_RELAY_SESSION="${PHONE_ARM_SESSION_RELAY_SESSION:-default}"
-export PHONE_ARM_SESSION_RELAY_ARM_TOKEN="${PHONE_ARM_SESSION_RELAY_ARM_TOKEN:-$(cat /home/user/.phone_arm_relay_arm_token)}"
-export PHONE_ARM_SESSION_RELAY_PHONE_TOKEN="${PHONE_ARM_SESSION_RELAY_PHONE_TOKEN:-$(cat /home/user/.phone_arm_relay_phone_token)}"
+export PHONE_ARM_SESSION_RELAY_ARM_TOKEN="${PHONE_ARM_SESSION_RELAY_ARM_TOKEN:-$(cat "$HOME/.phone_arm_relay_arm_token")}"
+export PHONE_ARM_SESSION_RELAY_PHONE_TOKEN="${PHONE_ARM_SESSION_RELAY_PHONE_TOKEN:-$(cat "$HOME/.phone_arm_relay_phone_token")}"
 
 # MediaMTX SFU for robot video. /webrtc/config advertises the WHEP endpoint
 # + subscriber token so the browser can subscribe directly to the SFU on the
 # VPS. If the play secret is absent, the browser has no robot-video fallback.
-if [ -r /home/user/.phone_arm_secrets/mediamtx_play_pw ]; then
+if [ -r "$HOME/.phone_arm_secrets/mediamtx_play_pw" ]; then
   export PHONE_ARM_MEDIAMTX_WHEP_URL="${PHONE_ARM_MEDIAMTX_WHEP_URL:-https://188-166-154-201.sslip.io/robot/whep}"
-  export PHONE_ARM_MEDIAMTX_PLAY_TOKEN="${PHONE_ARM_MEDIAMTX_PLAY_TOKEN:-$(cat /home/user/.phone_arm_secrets/mediamtx_play_pw)}"
+  export PHONE_ARM_MEDIAMTX_PLAY_TOKEN="${PHONE_ARM_MEDIAMTX_PLAY_TOKEN:-$(cat "$HOME/.phone_arm_secrets/mediamtx_play_pw")}"
 fi
 
 METRICS_PID=""
@@ -267,12 +274,12 @@ fi
 # whipinto instance.
 WHIP_SUPERVISOR_PID=""
 if [ -n "${PHONE_ARM_MEDIAMTX_WHEP_URL:-}" ] \
-   && [ -r /home/user/.phone_arm_secrets/mediamtx_publish_pw ]; then
-  MTX_PUB=$(cat /home/user/.phone_arm_secrets/mediamtx_publish_pw)
+   && [ -r "$HOME/.phone_arm_secrets/mediamtx_publish_pw" ]; then
+  MTX_PUB=$(cat "$HOME/.phone_arm_secrets/mediamtx_publish_pw")
   # Resolve the default video device via the follower gateway's camera logic
   # uses so the publisher tracks any camera reordering. Import-time
   # warnings go to stdout via third-party libs; take the LAST line only.
-  DEV=$(/home/user/.venv/lerobot/bin/python -c \
+  DEV=$("$PYTHON_BIN" -c \
       'from follower import gateway; print(gateway.VIDEO_DEVICE)' 2>/dev/null | tail -1)
   # Override the auto-resolved device for testing without hardware
   # (e.g. `PHONE_ARM_WHIP_INPUT_ARGS="-f lavfi -i testsrc2=size=640x480:rate=30"`).
@@ -310,7 +317,7 @@ trap _cleanup EXIT
 # while this is still running, Caddy can serve the previous app.js bundle.
 STATIC_APP_SHA="$(sha256sum "$PWD/controllers/phone/app.js" 2>/dev/null | awk '{ print $1 }' || true)"
 printf '[static] syncing operator assets to VPS app_schema=20260907b app_sha=%s\n' "${STATIC_APP_SHA:0:12}"
-if timeout 15 rsync -e "ssh -i /home/user/.ssh/do_wg_relay -o StrictHostKeyChecking=no -o ConnectTimeout=5" \
+if timeout 15 rsync -e "ssh -i $HOME/.ssh/do_wg_relay -o StrictHostKeyChecking=no -o ConnectTimeout=5" \
       -az --checksum --delete \
       "$PWD/controllers/phone/" \
       root@188.166.154.201:/opt/phone_arm/static/ \
@@ -324,7 +331,7 @@ fi
 # $PHONE_ARM_TRAJECTORY_CSV.
 # Tee output so the user sees it AND it lands in $LOG.
 set +e
-/home/user/.venv/lerobot/bin/python -u -m follower.main "$@" 2>&1 | tee "$LOG"
+"$PYTHON_BIN" -u -m follower.main "$@" 2>&1 | tee "$LOG"
 status=${PIPESTATUS[0]}
 set -e
 exit "$status"
