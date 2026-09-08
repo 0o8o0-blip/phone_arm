@@ -30,8 +30,9 @@ and tunnel before connecting a replacement follower.
 The replacement machine must be provisioned with the existing TURN, control
 relay, MediaMTX and bore credentials. Do not generate independent credentials
 on the follower; they must match the hosted services. The gateway's local TLS
-certificate is generated automatically. Once startup succeeds, mint a temporary
-browser-access link with:
+certificate is generated automatically. Every `run.sh` startup also creates a
+fresh two-hour browser token and prints the complete share URL. Additional
+links can still be minted manually with:
 
 ```sh
 ./follower/mint_token.py mint --name operator --expires 2h

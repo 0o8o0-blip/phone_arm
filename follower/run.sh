@@ -261,6 +261,16 @@ if [ -r "$HOME/.phone_arm_secrets/mediamtx_play_pw" ]; then
   export PHONE_ARM_MEDIAMTX_PLAY_TOKEN="${PHONE_ARM_MEDIAMTX_PLAY_TOKEN:-$(cat "$HOME/.phone_arm_secrets/mediamtx_play_pw")}"
 fi
 
+# Create one short-lived browser link for this run. The unique run ID avoids
+# replacing another operator's still-valid token, while purging keeps the local
+# token file from accumulating expired startup entries forever.
+echo "[access] creating a two-hour operator link"
+"$PYTHON_BIN" -m follower.mint_token purge-expired
+"$PYTHON_BIN" -m follower.mint_token mint \
+  --name "startup-$PHONE_ARM_RUN_ID" \
+  --expires 2h
+echo
+
 METRICS_PID=""
 if [ "${PHONE_ARM_METRICS:-1}" != "0" ]; then
   _start_metrics_logger "$METRICS" &
