@@ -52,7 +52,7 @@ def port_in_use(port: str) -> bool:
     return False
 
 
-def choose_port(requested: str | None, excluded_serials: set[str]) -> str:
+def choose_port(requested: str | None) -> str:
     if requested:
         if not os.path.exists(requested):
             raise SystemExit(f"leader arm port does not exist: {requested}")
@@ -60,23 +60,17 @@ def choose_port(requested: str | None, excluded_serials: set[str]) -> str:
             raise SystemExit(
                 f"leader arm port is already in use (possibly by the destination): {requested}"
             )
-        if _serial_from_port(requested) in excluded_serials:
-            raise SystemExit(f"refusing to use the destination arm as leader: {requested}")
         return requested
     detected = discover_ports()
     busy = [port for port in detected if port_in_use(port)]
-    excluded = [port for port in detected if _serial_from_port(port) in excluded_serials]
-    ports = [port for port in detected if port not in busy and port not in excluded]
+    ports = [port for port in detected if port not in busy]
     for port in busy:
         print(f"Ignoring arm already in use: {_serial_from_port(port)} ({port})")
-    for port in excluded:
-        print(f"Ignoring destination arm: {_serial_from_port(port)} ({port})")
     if not ports:
         raise SystemExit("no SO101 USB serial adapters found")
-    if len(ports) == 1:
-        print(f"Using the only detected arm: {ports[0]}")
-        return ports[0]
     if not sys.stdin.isatty():
+        if len(ports) == 1:
+            return ports[0]
         choices = "\n".join(f"  {i + 1}. {p}" for i, p in enumerate(ports))
         raise SystemExit(f"multiple arms detected; pass --port with one of:\n{choices}")
     print("Pick the arm to use as the leader:")
@@ -254,12 +248,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True, help="destination's /wt/phone relay URL")
     parser.add_argument("--port", help="leader USB path; omit for an interactive list")
-    parser.add_argument(
-        "--exclude-serial",
-        action="append",
-        default=[],
-        help="USB serial that belongs to the destination and cannot be selected",
-    )
     parser.add_argument("--calibration-id", help="lerobot calibration ID; defaults from USB serial")
     parser.add_argument("--calibration-dir", type=Path, default=DEFAULT_CALIBRATION_DIR)
     parser.add_argument("--hz", type=float, default=30.0)
@@ -269,7 +257,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.hz <= 0 or args.link_timeout <= 0:
         parser.error("--hz and --link-timeout must be positive")
-    args.port = choose_port(args.port, set(args.exclude_serial))
+    args.port = choose_port(args.port)
     calibration_id = calibration_id_for(args.port, args.calibration_id)
     print(f"Leader: {args.port} (calibration {calibration_id})")
     leader = connect_leader(args.port, calibration_id, args.calibration_dir)

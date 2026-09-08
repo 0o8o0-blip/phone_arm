@@ -79,7 +79,6 @@ import numpy as np
 from aiohttp import web
 from scipy.spatial.transform import Rotation
 
-from follower.hardware import ROBOT_ADAPTER_SERIAL
 from shared.leader_protocol import LEADER_MESSAGE_TYPE, parse_leader_positions
 
 
@@ -3222,8 +3221,6 @@ class BrowserPhone:
         command = (
             "cd ~/dev/phone_arm && ./controllers/leader_arm/run.sh --url "
             + shlex.quote(relay_url)
-            + " --exclude-serial "
-            + shlex.quote(ROBOT_ADAPTER_SERIAL)
         )
         return web.json_response(
             {

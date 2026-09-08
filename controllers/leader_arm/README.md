@@ -9,7 +9,7 @@ Start the destination normally:
 Open its authenticated web page and choose **Control with leader arm**. Copy
 the displayed command to the computer that has the physical leader attached.
 The command starts `controllers/leader_arm/controller.py`, ignores serial ports already in
-use, and prompts when more than one available arm remains.
+use, and prompts you to select from the available arms.
 
 Keep both arms still while connecting. Press Enter in the source terminal to
 anchor the leader to the follower's current pose and engage control. Movement
