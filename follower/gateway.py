@@ -1,11 +1,10 @@
 """BrowserPhone teleoperator: WebXR pose over WebTransport.
 
-The operator's Android phone connects to an HTTPS server hosted on this Pi
-(see ./browser/). WebXR streams 6DoF pose at ~30 Hz; the browser ships each
-pose as an unreliable WebTransport datagram to a session relay, which
-forwards to this Pi where the arm follows the pose. Robot video comes back
-via browser-native WHEP through MediaMTX/coturn TURN. This class exposes
-the pose stream as the local phone action schema consumed by `follower.main`.
+The hosted controller sends WebXR 6DoF pose at ~30 Hz as unreliable
+WebTransport datagrams to a session relay, which forwards them to this
+follower. Robot video comes back via browser-native WHEP through
+MediaMTX/coturn TURN. This class exposes the pose stream as the local phone
+action schema consumed by `follower.main`.
 
 ------------------------------------------------------------------------
 Process architecture
@@ -15,11 +14,11 @@ Process architecture
 the loop free of GC pauses and I/O jitter, two subprocesses are spawned during
 BrowserPhone.connect():
 
-  1. BrowserPhone HTTPS server subprocess (_browser_phone_process_main)
-     - serves the operator page on :8443, handles /webrtc/config and /test_event
+  1. BrowserPhone network subprocess (_browser_phone_process_main)
      - is the arm-side WebTransport client -- pose datagrams flow relay
        -> here -> _ingest_pose_msg -> IPC to main
      - owns SessionRecorder for pose.csv + debug.csv + events.jsonl
+     - can serve a local development API when hosted mode is disabled
 
   2. Trajectory writer subprocess (_trajectory_writer_process_main)
      - takes IK-tick trajectory rows over an mp.Queue, appends to
@@ -678,13 +677,11 @@ ALLOW_NO_TURN_FOR_LOCAL_REPRO = (
 )
 TURN_URLS_PHONE = [TURN_URL_PHONE] if TURN_URL_PHONE else []
 
-# Public URL the phone connects to. Caddy on the VPS terminates TLS for
-# 188-166-154-201.sslip.io with a Let's Encrypt cert, then reverse-proxies to
-# the bore tunnel (localhost:8443 on the VPS) which forwards to this process.
-# VPS_HOST is the IP the bore tunnel terminates against; it stays in the Pi-side
-# cert SAN but is no longer seen by phones (Caddy proxies with tls_insecure_skip_verify).
+# Public URL the phone connects to. In normal hosted operation, Caddy serves
+# the controller and the VPS API supplies its session configuration. The local
+# HTTPS server remains available only as a development fallback.
 VPS_PUBLIC_URL = "https://188-166-154-201.sslip.io"
-VPS_HOST = "188.166.154.201"
+HOSTED_API_URL = _os.environ.get("PHONE_ARM_HOSTED_API_URL", "").strip()
 
 # Session-relay WebTransport control transport.
 # The arm connects OUTBOUND as an "arm" peer to SESSION_RELAY_WT_URL; the
@@ -869,10 +866,8 @@ def _ensure_cert() -> tuple[Path, Path]:
         return cert, key
     CERTS_DIR.mkdir(parents=True, exist_ok=True)
     hostname = socket.gethostname()
-    # The phone connects to the VPS public IP (TLS terminates here behind the
-    # bore tunnel), so that IP must be in the SANs. No LAN IPs: we are not
-    # reachable on the LAN anymore -- everything goes through the VPS.
-    sans = ["DNS:localhost", f"DNS:{hostname}", "IP:127.0.0.1", f"IP:{VPS_HOST}"]
+    # This certificate is used only by the optional local development server.
+    sans = ["DNS:localhost", f"DNS:{hostname}", "IP:127.0.0.1"]
     san_str = ",".join(sans)
     subprocess.run(
         [
@@ -2980,6 +2975,34 @@ class BrowserPhone:
         return await handler(request)
 
     async def _start_server(self) -> None:
+        if HOSTED_API_URL:
+            if not TURN_URL and not ALLOW_NO_TURN_FOR_LOCAL_REPRO:
+                raise RuntimeError(
+                    "WHEP video is relay-only but no TURN server is configured. "
+                    "follower/run.sh supplies PHONE_ARM_TURN_URL/USER/PW from ~/.turn_secret."
+                )
+            if ((not MEDIAMTX_WHEP_URL or not MEDIAMTX_PLAY_TOKEN)
+                    and not ALLOW_NO_TURN_FOR_LOCAL_REPRO):
+                raise RuntimeError(
+                    "WHEP video is enabled in the browser but MediaMTX config is missing. "
+                    "follower/run.sh supplies PHONE_ARM_MEDIAMTX_WHEP_URL/PLAY_TOKEN."
+                )
+            print(
+                f"[browser_phone] hosted web API={HOSTED_API_URL}; "
+                "local HTTPS disabled"
+            )
+            print(
+                "[browser_phone] session relay (WT) enabled "
+                f"session={SESSION_RELAY_SESSION} url={SESSION_RELAY_WT_URL}"
+            )
+            asyncio.ensure_future(self._loop_lag_probe())
+            self._relay_task = asyncio.ensure_future(self._relay_wt_arm_loop())
+            self._relay_stats_task = asyncio.ensure_future(self._relay_stats_loop())
+            self._start_ipc_command_thread()
+            self._ready_event.set()
+            self._notify_process_status("ready", None)
+            return
+
         cert, key = _ensure_cert()
         ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_ctx.load_cert_chain(cert, key)
@@ -3018,9 +3041,8 @@ class BrowserPhone:
 
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
-        # Loopback ONLY: the phone reaches us exclusively through the VPS bore
-        # tunnel (bore connects to localhost:8443 on this Pi). Nothing is served
-        # directly on the LAN -- all phone traffic goes through the VPS.
+        # Development fallback only. Production browser API traffic terminates
+        # on the VPS and never enters this listener.
         self._site = web.TCPSite(self._runner, host="127.0.0.1", port=self.port,
                                  ssl_context=ssl_ctx)
         await self._site.start()

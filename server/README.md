@@ -7,6 +7,8 @@ controller or follower machine when they use an existing hosted relay.
   one follower in each named session.
 - `forwarder.py` is an optional regional edge that forwards controller traffic
   to the main relay.
+- `api.py` accepts outbound follower registration and supplies short-lived,
+  authenticated browser configuration.
 - `run.sh` starts the main relay and reads TLS and token configuration from
   environment variables.
 

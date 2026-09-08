@@ -1,6 +1,5 @@
 188-166-154-201.sslip.io {
-	# Static phone-controller assets served directly from the VPS. Sync via
-	# rsync from the follower on startup.
+	# Static phone-controller assets are deployed with the server.
 	handle /static/* {
 		header Cache-Control "no-cache, no-store, must-revalidate"
 		header Pragma "no-cache"
@@ -52,14 +51,14 @@
 		respond 401
 	}
 
-	# Everything else (WebRTC signaling, /webrtc/config, /test_event, /healthz,
-	# /stats, /shutdown) proxies through the bore tunnel to the Pi's HTTPS
-	# server on localhost:8443.
+	# The follower registers its current relay and video configuration outbound.
+	# Browser requests terminate here; no inbound tunnel to the follower exists.
+	@session_api path /api/follower/* /webrtc/config /leader/config /control/release /stats /test_event /healthz
+	handle @session_api {
+		reverse_proxy http://127.0.0.1:8080
+	}
+
 	handle {
-		reverse_proxy https://localhost:8443 {
-			transport http {
-				tls_insecure_skip_verify
-			}
-		}
+		respond 404
 	}
 }

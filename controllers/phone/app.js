@@ -2175,7 +2175,7 @@ async function showLeaderSetup() {
     if (response.status === 401) {
       throw new Error(
         'This page is not authenticated. On the robot server run ' +
-        './follower/mint_token.py show global, then open the full URL it prints.'
+        'Ask the follower operator for the two-hour link printed by follower/run.sh.'
       );
     }
     if (!response.ok) throw new Error(`HTTP ${response.status}`);

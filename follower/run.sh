@@ -252,6 +252,7 @@ export PHONE_ARM_SESSION_RELAY_WT_URL_PHONE="${PHONE_ARM_SESSION_RELAY_WT_URL_PH
 export PHONE_ARM_SESSION_RELAY_SESSION="${PHONE_ARM_SESSION_RELAY_SESSION:-default}"
 export PHONE_ARM_SESSION_RELAY_ARM_TOKEN="${PHONE_ARM_SESSION_RELAY_ARM_TOKEN:-$(cat "$HOME/.phone_arm_relay_arm_token")}"
 export PHONE_ARM_SESSION_RELAY_PHONE_TOKEN="${PHONE_ARM_SESSION_RELAY_PHONE_TOKEN:-$(cat "$HOME/.phone_arm_relay_phone_token")}"
+export PHONE_ARM_HOSTED_API_URL="${PHONE_ARM_HOSTED_API_URL:-https://188-166-154-201.sslip.io}"
 
 # MediaMTX SFU for robot video. /webrtc/config advertises the WHEP endpoint
 # + subscriber token so the browser can subscribe directly to the SFU on the
@@ -261,15 +262,16 @@ if [ -r "$HOME/.phone_arm_secrets/mediamtx_play_pw" ]; then
   export PHONE_ARM_MEDIAMTX_PLAY_TOKEN="${PHONE_ARM_MEDIAMTX_PLAY_TOKEN:-$(cat "$HOME/.phone_arm_secrets/mediamtx_play_pw")}"
 fi
 
-# Create one short-lived browser link for this run. The unique run ID avoids
-# replacing another operator's still-valid token, while purging keeps the local
-# token file from accumulating expired startup entries forever.
+# Register this follower with the VPS and create one short-lived browser link.
+# The VPS owns browser tokens; relay and media credentials remain on the two
+# machines that need them and are held only in API memory.
 echo "[access] creating a two-hour operator link"
-"$PYTHON_BIN" -m follower.mint_token purge-expired
-"$PYTHON_BIN" -m follower.mint_token mint \
-  --name "startup-$PHONE_ARM_RUN_ID" \
-  --expires 2h
+"$PYTHON_BIN" -m follower.hosted_api register \
+  --mint-name "startup-$PHONE_ARM_RUN_ID" \
+  --expires-s 7200
 echo
+
+HOSTED_API_PID=""
 
 METRICS_PID=""
 if [ "${PHONE_ARM_METRICS:-1}" != "0" ]; then
@@ -311,6 +313,9 @@ if [ -n "${PHONE_ARM_MEDIAMTX_WHEP_URL:-}" ] \
 fi
 
 _cleanup() {
+  if [ -n "$HOSTED_API_PID" ]; then
+    kill "$HOSTED_API_PID" 2>/dev/null || true
+  fi
   if [ -n "$WHIP_SUPERVISOR_PID" ]; then
     kill "$WHIP_SUPERVISOR_PID" 2>/dev/null || true
   fi
@@ -318,24 +323,13 @@ _cleanup() {
     kill "$METRICS_PID" 2>/dev/null || true
     wait "$METRICS_PID" 2>/dev/null || true
   fi
+  [ -n "$HOSTED_API_PID" ] && wait "$HOSTED_API_PID" 2>/dev/null || true
   [ -n "$WHIP_SUPERVISOR_PID" ] && wait "$WHIP_SUPERVISOR_PID" 2>/dev/null || true
 }
 trap _cleanup EXIT
 
-# Push the operator-facing static assets (index.html + app.js) to the VPS
-# before teleop starts. This is intentionally foreground: if the phone loads
-# while this is still running, Caddy can serve the previous app.js bundle.
-STATIC_APP_SHA="$(sha256sum "$PWD/controllers/phone/app.js" 2>/dev/null | awk '{ print $1 }' || true)"
-printf '[static] syncing operator assets to VPS app_schema=20260907b app_sha=%s\n' "${STATIC_APP_SHA:0:12}"
-if timeout 15 rsync -e "ssh -i $HOME/.ssh/do_wg_relay -o StrictHostKeyChecking=no -o ConnectTimeout=5" \
-      -az --checksum --delete \
-      "$PWD/controllers/phone/" \
-      root@188.166.154.201:/opt/phone_arm/static/ \
-      >/dev/null 2>&1; then
-  printf '[static] VPS static sync complete\n'
-else
-  printf '[static] WARNING: VPS static sync failed; operators may see stale app.js\n'
-fi
+"$PYTHON_BIN" -u -m follower.hosted_api heartbeat &
+HOSTED_API_PID=$!
 
 # follower.main records per-frame phone / desired-EE / measured-EE to
 # $PHONE_ARM_TRAJECTORY_CSV.

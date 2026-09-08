@@ -1,0 +1,23 @@
+[Unit]
+Description=Phone Arm hosted browser API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=caddy
+Group=caddy
+UMask=0077
+LoadCredential=arm_token:/etc/phone_arm/arm_token
+ExecStart=/usr/bin/python3 /opt/phone_arm/api.py --host 127.0.0.1 --port 8080 --arm-secret @%d/arm_token --public-url https://188-166-154-201.sslip.io --state-file /var/lib/phone-arm-api/tokens.json --event-log /var/log/phone-arm-api/events.jsonl
+Restart=on-failure
+RestartSec=2
+StateDirectory=phone-arm-api
+LogsDirectory=phone-arm-api
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

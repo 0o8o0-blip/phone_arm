@@ -1,21 +1,21 @@
 # VPS configuration
 
 Live infrastructure configs for the London relay droplet
-(`188.166.154.201`, DO tag `claude-relay`). Kept in-repo so they're
-versioned; the VPS filesystem is the source of truth at runtime, this is
-just the checked-in copy.
+(`188.166.154.201`). They are versioned here and deployed to the VPS.
 
 ## `Caddyfile`
 
 Deployed at `/etc/caddy/Caddyfile` on the VPS. Serves:
 - Static operator page (index.html + app.js) directly from
-  `/opt/phone_arm/static/`. Rsynced from the Pi on teleop startup
-  (see `follower/run.sh`).
+  `/opt/phone_arm/static/`. Deploy these with the server, not from a follower.
 - `/robot/whip*` and `/robot/whep*` -> reverse-proxy to MediaMTX
   (loopback :8889). WHIP is used by the Pi to publish video into the
   SFU; WHEP is used by phones to subscribe.
-- Everything else -> reverse-proxy to `https://localhost:8443`, which
-  is the bore tunnel terminating against the Pi's HTTPS server.
+- Browser configuration endpoints -> `api.py` on loopback port 8080.
+  Followers register there using an outbound HTTPS request and heartbeat.
+
+There is no inbound follower tunnel. A follower needs only ordinary outbound
+Internet access for HTTPS, WebTransport and WHIP.
 
 To redeploy:
 ```
@@ -99,10 +99,23 @@ The operator page uses WHEP by default. Both the SFU URL and the subscribe
 token are advertised in the Pi's `/webrtc/config` response when
 `PHONE_ARM_MEDIAMTX_WHEP_URL` + `PHONE_ARM_MEDIAMTX_PLAY_TOKEN` are set.
 
+## Hosted API
+
+Deploy `server/api.py` at `/opt/phone_arm/api.py`, install
+`phone-arm-api.service`, then enable it. It runs as `caddy`, reads the existing
+arm relay credential from `/etc/phone_arm/arm_token`, keeps active follower
+configuration in memory, and persists only short-lived browser tokens.
+
+```sh
+scp -i ~/.ssh/do_wg_relay server/api.py root@188.166.154.201:/opt/phone_arm/api.py
+scp -i ~/.ssh/do_wg_relay server/deploy/vps/phone-arm-api.service root@188.166.154.201:/etc/systemd/system/phone-arm-api.service
+ssh -i ~/.ssh/do_wg_relay root@188.166.154.201 "systemctl daemon-reload && systemctl enable --now phone-arm-api"
+```
+
 ## Systemd services on this VPS
 
 - `caddy` -- reverse proxy + Let's Encrypt cert
-- `bore-server` -- bore tunnel terminator (Pi connects OUT to this)
+- `phone-arm-api` -- follower registration and browser session configuration
 - `coturn` -- WebRTC TURN relay used by browser WHEP playback
 - `phone-arm-wt` -- WebTransport (QUIC) control relay for pose datagrams
 - `mediamtx` -- WebRTC SFU (WHIP ingest, WHEP egress) for robot video

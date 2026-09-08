@@ -23,17 +23,17 @@ LeRobot's calibration flow runs after selection when one is required.
 
 The existing London relay, public page, MediaMTX video service and Singapore
 edge can be reused by another follower, but the deployment is currently
-one-to-one: only one follower may own the `default` control session, `robot`
-video path and public port-8443 bore tunnel at a time. Stop the current follower
-and tunnel before connecting a replacement follower.
+one-to-one: only one follower may own the `default` control session and `robot`
+video path at a time. Stop the current follower before connecting its
+replacement.
 
 The replacement machine must be provisioned with the existing TURN, control
-relay, MediaMTX and bore credentials. Do not generate independent credentials
-on the follower; they must match the hosted services. The gateway's local TLS
-certificate is generated automatically. Every `run.sh` startup also creates a
-fresh two-hour browser token and prints the complete share URL. Additional
-links can still be minted manually with:
+relay and MediaMTX credentials. Do not generate independent credentials on the
+follower; they must match the hosted services. No inbound port, TLS certificate,
+SSH key or tunnel is required on the follower. Every `run.sh` startup registers
+the follower outbound, creates a fresh two-hour browser token on the VPS, and
+prints the complete share URL.
 
 ```sh
-./follower/mint_token.py mint --name operator --expires 2h
+./follower/run.sh
 ```
