@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from .capabilities import verify as verify_capability
+except ImportError:  # Direct deployment alongside capabilities.py.
+    from capabilities import verify as verify_capability
+
+try:
     import aioquic
     from aioquic.asyncio import QuicConnectionProtocol, serve
     from aioquic.h3.connection import H3_ALPN, H3Connection
@@ -245,17 +250,28 @@ class ControlRelay:
         *,
         phone_secret: str = "",
         arm_secret: str = "",
+        capability_secret: str = "",
         max_datagram_bytes: int = 1024,
     ) -> None:
         self.role_secrets = {"phone": phone_secret, "arm": arm_secret}
+        self.capability_secret = capability_secret
         self.max_datagram_bytes = max_datagram_bytes
         self.sessions: dict[str, ControlSession] = {}
 
-    def authorized(self, role: str, token: str) -> bool:
-        secret = self.role_secrets.get(role, "")
-        if not secret:
+    def authorized(self, role: str, token: str, session: str) -> bool:
+        if self.capability_secret and verify_capability(
+            self.capability_secret,
+            token,
+            role=role,
+            session=session,
+        ):
             return True
-        return hmac.compare_digest(token or "", secret)
+        secret = self.role_secrets.get(role, "")
+        if secret:
+            return hmac.compare_digest(token or "", secret)
+        if not self.capability_secret:
+            return True
+        return False
 
     def get_session(self, name: str) -> ControlSession:
         session = self.sessions.get(name)
@@ -643,7 +659,8 @@ class HttpServerProtocol(QuicConnectionProtocol):
                         return
                     role = path.rsplit("/", 1)[-1]
                     token = (query.get("token") or [""])[0]
-                    if not CONTROL_RELAY.authorized(role, token):
+                    session = (query.get("session") or ["default"])[0]
+                    if not CONTROL_RELAY.authorized(role, token, session):
                         record_event("wt_unauthorized", {
                             "role": role,
                             "session": (query.get("session") or ["default"])[0],
@@ -730,6 +747,10 @@ async def main() -> None:
     parser.add_argument("--stats-interval-s", type=float, default=5.0)
     parser.add_argument("--phone-secret", default=os.environ.get("PHONE_ARM_WT_PHONE_SECRET", ""))
     parser.add_argument("--arm-secret", default=os.environ.get("PHONE_ARM_WT_ARM_SECRET", ""))
+    parser.add_argument(
+        "--capability-secret",
+        default=os.environ.get("PHONE_ARM_CAPABILITY_SECRET", ""),
+    )
     parser.add_argument("--max-datagram-bytes", type=int, default=int(os.environ.get("PHONE_ARM_WT_MAX_DATAGRAM_BYTES", "1024")))
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -738,13 +759,15 @@ async def main() -> None:
     EVENT_LOG_PATH = args.event_log
     phone_secret = _read_secret_arg(args.phone_secret)
     arm_secret = _read_secret_arg(args.arm_secret)
-    if not phone_secret or not arm_secret:
+    capability_secret = _read_secret_arg(args.capability_secret)
+    if not capability_secret and (not phone_secret or not arm_secret):
         parser.error(
-            "both --phone-secret and --arm-secret must resolve to non-empty values"
+            "--capability-secret or both legacy role secrets are required"
         )
     CONTROL_RELAY = ControlRelay(
         phone_secret=phone_secret,
         arm_secret=arm_secret,
+        capability_secret=capability_secret,
         max_datagram_bytes=max(1, args.max_datagram_bytes),
     )
 

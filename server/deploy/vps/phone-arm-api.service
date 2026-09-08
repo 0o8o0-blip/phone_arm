@@ -8,8 +8,9 @@ Type=simple
 User=caddy
 Group=caddy
 UMask=0077
-LoadCredential=arm_token:/etc/phone_arm/arm_token
-ExecStart=/usr/bin/python3 /opt/phone_arm/api.py --host 127.0.0.1 --port 8080 --arm-secret @%d/arm_token --public-url https://188-166-154-201.sslip.io --state-file /var/lib/phone-arm-api/tokens.json --event-log /var/log/phone-arm-api/events.jsonl
+LoadCredential=capability_secret:/etc/phone_arm/capability_secret
+LoadCredential=turn_secret:/etc/phone_arm/turn_rest_secret
+ExecStart=/usr/bin/python3 /opt/phone_arm/api.py --host 127.0.0.1 --port 8080 --capability-secret @%d/capability_secret --turn-secret @%d/turn_secret --public-url https://188-166-154-201.sslip.io --relay-url-europe https://188-166-154-201.sslip.io:4433/wt --relay-url-asia https://146-190-104-81.sslip.io:4434/wt --turn-url-europe "turn:188.166.154.201:3478?transport=udp" --turn-url-asia "turn:146.190.104.81:3478?transport=udp" --state-file /var/lib/phone-arm-api/tokens.json --event-log /var/log/phone-arm-api/events.jsonl
 Restart=on-failure
 RestartSec=2
 StateDirectory=phone-arm-api

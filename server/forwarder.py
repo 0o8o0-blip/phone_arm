@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Regional WebTransport forwarder for an upstream Phone Arm relay.
 
-Architecture: this process listens for WT CONNECT requests at /wt/phone and,
+Architecture: this process listens for WT CONNECT requests at /wt/phone or
+/wt/arm and,
 for each accepted session, opens its own WT client connection upstream to a
 real relay (e.g. the London phone-arm-wt server). All datagrams flow:
 
@@ -32,8 +33,9 @@ Why this is faster than putting the whole relay near the operator:
 We get ~10 ms RTT improvement on a Manila->London tele-op path plus a
 meaningful jitter reduction on the long leg.
 
-Only /wt/phone connections are accepted (and forwarded). The arm peer is
-expected to connect directly to the upstream relay.
+Both roles are accepted. This makes the edge symmetric: an Asia controller can
+reach a London robot through it, and an Asia robot can reach a London
+controller through the same service.
 
 USAGE
     python3 -m server.forwarder \\
@@ -474,10 +476,7 @@ class HttpServerProtocol(QuicConnectionProtocol):
                     transmit=self.transmit,
                 )
                 self._handlers[event.stream_id] = handler
-                # Forwarder only handles the operator-facing /wt/phone path.
-                # /wt/arm is intentionally rejected here; Pi must connect to the
-                # upstream relay directly.
-                if path == "/wt/phone":
+                if path in {"/wt/phone", "/wt/arm"}:
                     handler.accept_and_forward()
                 else:
                     handler.reject(404)
@@ -486,7 +485,7 @@ class HttpServerProtocol(QuicConnectionProtocol):
                 self._text(event.stream_id, 200, "ok\n")
                 return
             self._text(event.stream_id, 200,
-                       "phone-arm WebTransport forwarder\nforwarding /wt/phone -> upstream\n")
+                       "phone-arm WebTransport edge\nforwarding /wt/phone and /wt/arm -> upstream\n")
         elif isinstance(event, DatagramReceived):
             handler = self._handlers.get(event.stream_id)
             if handler is not None and handler.accepted:

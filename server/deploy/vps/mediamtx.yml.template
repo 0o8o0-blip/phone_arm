@@ -26,13 +26,13 @@ webrtcLocalUDPAddress: :8189
 # Advertise the droplet's PUBLIC IP in ICE candidates. Without this the
 # SFU would offer 10.16.0.5 (internal droplet IP), unroutable from phones.
 webrtcAdditionalHosts: [188.166.154.201]
-webrtcICEServers2:
-  - url: turn:188.166.154.201:3478?transport=udp
-    username: teleop
-    password: ${TURN_PW}
+# Browsers receive short-lived TURN REST credentials from the session API.
+# MediaMTX itself is publicly reachable on its UDP ICE port and does not need
+# to allocate a TURN relay candidate.
+webrtcICEServers2: []
 
-# Auth is done at the Caddy layer (see server/deploy/vps/Caddyfile: basic_auth on
-# /robot/whip* and /robot/whep*). MediaMTX itself trusts anything coming
+# Auth is done at the Caddy layer with session-scoped capabilities. MediaMTX
+# itself trusts anything coming
 # from loopback -- and it's bound to 127.0.0.1:8889 so nothing except
 # Caddy can reach it.
 #
@@ -50,6 +50,6 @@ authInternalUsers:
       - action: api
 
 paths:
-  robot:
+  "~^r_[A-Za-z0-9_-]{12,40}$":
     source: publisher
     record: no

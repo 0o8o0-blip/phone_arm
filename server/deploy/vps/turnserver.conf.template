@@ -1,0 +1,11 @@
+listening-port=3478
+fingerprint
+realm=teleop
+min-port=49160
+max-port=49200
+external-ip=188.166.154.201
+no-tls
+no-dtls
+no-cli
+use-auth-secret
+static-auth-secret=TURN_REST_SECRET_GOES_HERE

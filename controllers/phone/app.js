@@ -31,7 +31,7 @@ const followFillEl = $('follow-fill');
 const logEl = $('log');
 
 // Keep this short because it is also stamped onto control datagrams.
-const APP_SCHEMA_ID = '20260907b';
+const APP_SCHEMA_ID = '20260908a';
 const APP_BOOT_MS = Date.now();
 const APP_SCRIPT_SRC = document.currentScript ? document.currentScript.src : '';
 const APP_PAGE_ID = (() => {
@@ -60,32 +60,60 @@ function appEventFields(now = Date.now()) {
 }
 
 // --- Auth token -----------------------------------------------------------
-// Token lifecycle: use only the ?t=TOKEN from the current URL. Do not persist
-// worker tokens in browser storage; a bare URL may load the landing page, but
-// protected robot endpoints must fail without an explicit token.
+// The invitation capability lives in the URL fragment, which browsers do not
+// send to Caddy or ordinary access logs. It is attached only as an
+// Authorization header on protected API calls. Legacy ?t= links remain valid
+// during migration.
 let pageAuthToken = '';
 (function loadTokenFromUrl() {
+  const fragment = new URLSearchParams(location.hash.replace(/^#/, ''));
   const params = new URLSearchParams(location.search);
-  const fromUrl = params.get('t');
+  const fromUrl = fragment.get('access') || params.get('t');
   if (fromUrl) {
     pageAuthToken = fromUrl;
     try { localStorage.removeItem('phoneArmToken'); } catch (_) {}
   }
 })();
 function authToken() { return pageAuthToken; }
-function withToken(url) {
-  const t = authToken();
-  if (!t) return url;
-  return url + (url.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(t);
+function apiFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if (authToken()) headers.set('Authorization', `Bearer ${authToken()}`);
+  return fetch(url, { ...options, headers });
 }
+
+// Both regional edges accept both robot and controller roles. Probe their
+// HTTPS endpoints once and use the lower-latency ingress.
+let preferredEdge = 'europe';
+async function edgeLatency(name, url) {
+  const started = performance.now();
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const response = await fetch(url, { cache: 'no-store', signal: controller.signal });
+    clearTimeout(timer);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return { name, ms: performance.now() - started };
+  } catch (_) {
+    return { name, ms: Infinity };
+  }
+}
+const edgeSelectionReady = Promise.all([
+  edgeLatency('europe', '/healthz'),
+  edgeLatency('asia', 'https://146-190-104-81.sslip.io/'),
+]).then(results => {
+  results.sort((a, b) => a.ms - b.ms);
+  if (Number.isFinite(results[0].ms)) preferredEdge = results[0].name;
+  log(`nearest relay edge: ${preferredEdge}`);
+});
 
 function configUrl(extra = {}) {
   const params = new URLSearchParams({
     page_id: APP_PAGE_ID,
     app_v: APP_SCHEMA_ID,
+    edge: preferredEdge,
     ...extra,
   });
-  return withToken(`/webrtc/config?${params.toString()}`);
+  return `/webrtc/config?${params.toString()}`;
 }
 
 function setClientRole(role, reason = '') {
@@ -264,7 +292,8 @@ const video = {
     video.state = 'config';
     video.lastError = '';
     try {
-      const cfg = await fetch(configUrl({ role: 'viewer' }), { cache: 'no-store' })
+      await edgeSelectionReady;
+      const cfg = await apiFetch(configUrl({ role: 'viewer' }), { cache: 'no-store' })
         .then(r => {
           if (!r.ok) throw new Error(`config ${r.status}`);
           return r.json();
@@ -337,8 +366,8 @@ const _controlTextDecoder = new TextDecoder();
 // log "operator commanded action X while looking at frame Y."
 let _displayedRtpTs = null;        // RTP timestamp of most recently displayed video frame
 let _tOpDisplayedMs = null;        // browser Date.now() at the moment that frame was scheduled to display
-// Relay-only: WebRTC media always goes through the VPS TURN relay. There is no
-// direct/LAN path; the server only ever returns 'relay' here.
+// The hosted API prefers direct ICE to public MediaMTX and supplies TURN as a
+// fallback for restrictive networks. This initial value is replaced by config.
 let iceTransportPolicy = 'relay';
 
 function pollWebRTCStats() {
@@ -490,7 +519,8 @@ function updateRobotTrackingMeter() {
 // "POST an SDP offer, get an SDP answer" HTTP flow. Auth is a Bearer
 // token that Caddy validates before proxying to MediaMTX. The Pi is
 // not involved in video signaling at all in this path -- signaling
-// terminates on the VPS and media flows SFU->phone through TURN.
+// terminates on the VPS; media uses direct ICE when possible and TURN when
+// the operator network requires it.
 async function startVideoWHEP(whepUrl, token, iceServers, policy) {
   let pc = null;
   try {
@@ -733,16 +763,17 @@ function scheduleControlReconnect(reason, immediate = false) {
   _controlReconnectDelay = Math.min(_controlReconnectDelay * 2, 4000);
 }
 
-function startControl() {
+async function startControl() {
   if (_controlStarting) return;
   _controlShouldReconnect = true;
   if (!_controlHealthTimer) {
     _controlHealthTimer = setInterval(checkControlHealth, CONTROL_HEALTH_CHECK_MS);
   }
   _controlStarting = true;
+  await edgeSelectionReady;
   // WebTransport is the only control transport we support. A control claimant
   // must be granted the controller role before the server returns the WT URL.
-  fetch(configUrl({ want_control: '1' }), { cache: 'no-store' })
+  apiFetch(configUrl({ want_control: '1' }), { cache: 'no-store' })
     .then(r => {
       if (!r.ok) throw new Error(`config ${r.status}`);
       return r.json();
@@ -845,7 +876,7 @@ async function pollControlWebTransportStats(wt) {
       } catch (_) {}
     }
     try {
-      fetch(withToken('/test_event'), {
+      apiFetch('/test_event', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         cache: 'no-store',
@@ -1057,7 +1088,7 @@ function releaseControlClaim(reason = 'release') {
   if (!_controlClaimActive) return;
   _controlClaimActive = false;
   try {
-    fetch(withToken(`/control/release?page_id=${encodeURIComponent(APP_PAGE_ID)}`), {
+    apiFetch(`/control/release?page_id=${encodeURIComponent(APP_PAGE_ID)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       cache: 'no-store',
@@ -1108,7 +1139,7 @@ function log(msg) {
   logEl.textContent = `${ts} ${msg}\n` + logEl.textContent;
   logEl.scrollTop = 0;
   try {
-    fetch(withToken('/test_event'), {
+    apiFetch('/test_event', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       cache: 'no-store',
@@ -1423,7 +1454,7 @@ function postPoseSourceStats(reason = 'periodic') {
   try {
     _controlDebugPostCount++;
     const body = JSON.stringify(poseSourceSnapshot(reason));
-    fetch(withToken('/test_event'), {
+    apiFetch('/test_event', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       cache: 'no-store',
@@ -1519,7 +1550,7 @@ function startThermalProbes() {
             // Emit a discrete event for each transition — easy to align
             // against the dXrFrameCount timeline post-hoc.
             try {
-              fetch(withToken('/test_event'), {
+              apiFetch('/test_event', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 cache: 'no-store',
@@ -2171,11 +2202,15 @@ async function showLeaderSetup() {
   leaderPanel.classList.add('show');
   leaderCommandEl.textContent = 'Loading command…';
   try {
-    const response = await fetch(withToken('/leader/config'), { cache: 'no-store' });
+    await edgeSelectionReady;
+    const response = await apiFetch(
+      `/leader/config?edge=${encodeURIComponent(preferredEdge)}`,
+      { cache: 'no-store' },
+    );
     if (response.status === 401) {
       throw new Error(
-        'This page is not authenticated. On the robot server run ' +
-        'Ask the follower operator for the two-hour link printed by follower/run.sh.'
+        'This page is not authenticated. Ask the follower operator for the '
+        + 'control link printed by follower/run.sh.'
       );
     }
     if (!response.ok) throw new Error(`HTTP ${response.status}`);

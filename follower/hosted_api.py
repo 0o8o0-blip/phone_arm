@@ -1,103 +1,61 @@
 #!/usr/bin/env python3
-"""Register a follower with the hosted browser API."""
+"""Create and maintain an anonymous hosted robot session."""
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
+import shlex
 import socket
 import sys
 import time
+from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
 DEFAULT_API_URL = "https://188-166-154-201.sslip.io"
+EDGE_PROBES = {
+    "europe": "https://188-166-154-201.sslip.io/healthz",
+    "asia": "https://146-190-104-81.sslip.io/",
+}
 
 
-def _required(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise RuntimeError(f"required environment variable is missing: {name}")
-    return value
+def _probe_edge(item: tuple[str, str]) -> tuple[str, float]:
+    name, url = item
+    started = time.monotonic()
+    try:
+        with urlopen(Request(url, headers={"User-Agent": "phone-arm-edge-probe/1"}), timeout=3):
+            return name, time.monotonic() - started
+    except Exception:
+        return name, float("inf")
 
 
-def _relay_url(role: str) -> str:
-    canonical = _required("PHONE_ARM_SESSION_RELAY_WT_URL")
-    base = (
-        os.environ.get("PHONE_ARM_SESSION_RELAY_WT_URL_PHONE", "").strip()
-        if role == "phone"
-        else canonical
-    ) or canonical
-    if base.startswith("wss://"):
-        base = "https://" + base[len("wss://") :]
-    base = base.rstrip("/")
-    if base.endswith(("/phone", "/arm")):
-        base = base.rsplit("/", 1)[0]
-    elif not base.endswith("/wt"):
-        base += "/wt"
-    token_name = (
-        "PHONE_ARM_SESSION_RELAY_ARM_TOKEN"
-        if role == "arm"
-        else "PHONE_ARM_SESSION_RELAY_PHONE_TOKEN"
-    )
-    query = urlencode(
-        {
-            "session": os.environ.get(
-                "PHONE_ARM_SESSION_RELAY_SESSION", "default"
-            ).strip()
-            or "default",
-            "token": _required(token_name),
-        }
-    )
-    return f"{base}/{role}?{query}"
+def choose_edge() -> str:
+    requested = os.environ.get("PHONE_ARM_EDGE", "").strip().lower()
+    if requested in EDGE_PROBES:
+        return requested
+    api_url = os.environ.get("PHONE_ARM_HOSTED_API_URL", DEFAULT_API_URL)
+    if api_url.startswith(("http://127.0.0.1", "http://localhost")):
+        return "europe"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = dict(pool.map(_probe_edge, EDGE_PROBES.items()))
+    return min(results, key=results.get) if any(value < float("inf") for value in results.values()) else "europe"
 
 
-def _payload(mint_name: str | None, expires_s: float) -> dict[str, object]:
-    turn_url = (
-        os.environ.get("PHONE_ARM_TURN_URL_PHONE", "").strip()
-        or _required("PHONE_ARM_TURN_URL")
-    )
-    session = (
-        os.environ.get("PHONE_ARM_SESSION_RELAY_SESSION", "default").strip()
-        or "default"
-    )
-    payload: dict[str, object] = {
-        "follower_id": os.environ.get("PHONE_ARM_FOLLOWER_ID", socket.gethostname()),
-        "session": session,
-        "config": {
-            "iceServers": [
-                {
-                    "urls": [turn_url],
-                    "username": _required("PHONE_ARM_TURN_USER"),
-                    "credential": _required("PHONE_ARM_TURN_PW"),
-                }
-            ],
-            "iceTransportPolicy": "relay",
-            "mediamtxWhepUrl": _required("PHONE_ARM_MEDIAMTX_WHEP_URL"),
-            "mediamtxPlayToken": _required("PHONE_ARM_MEDIAMTX_PLAY_TOKEN"),
-            "phoneRelayWtUrl": _relay_url("phone"),
-            "leaderRelayWtUrl": _relay_url("arm"),
-        },
-    }
-    if mint_name:
-        payload["mint"] = {"name": mint_name, "expires_s": expires_s}
-    return payload
-
-
-def register(mint_name: str | None = None, expires_s: float = 7200) -> dict:
+def _post(path: str, body: dict, token: str = "") -> dict:
     api_url = os.environ.get("PHONE_ARM_HOSTED_API_URL", DEFAULT_API_URL).rstrip("/")
-    body = json.dumps(_payload(mint_name, expires_s)).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "phone-arm-follower/2",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     request = Request(
-        f"{api_url}/api/follower/register",
-        data=body,
-        headers={
-            "Authorization": "Bearer "
-            + _required("PHONE_ARM_SESSION_RELAY_ARM_TOKEN"),
-            "Content-Type": "application/json",
-            "User-Agent": "phone-arm-follower/1",
-        },
+        api_url + path,
+        data=json.dumps(body).encode(),
+        headers=headers,
         method="POST",
     )
     try:
@@ -110,40 +68,100 @@ def register(mint_name: str | None = None, expires_s: float = 7200) -> dict:
         raise RuntimeError(f"could not reach hosted API: {exc.reason}") from exc
 
 
-def heartbeat(interval_s: float) -> None:
+def _atomic_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
+
+
+def _write_env(path: Path, state: dict) -> None:
+    values = {
+        "PHONE_ARM_HOSTED_API_URL": os.environ.get(
+            "PHONE_ARM_HOSTED_API_URL", DEFAULT_API_URL
+        ),
+        "PHONE_ARM_SESSION_RELAY_SESSION": state["session"],
+        "PHONE_ARM_SESSION_RELAY_WT_URL": state["relay_url"],
+        "PHONE_ARM_SESSION_RELAY_ARM_TOKEN": state["arm_relay_token"],
+        "PHONE_ARM_MEDIAMTX_WHIP_URL": state["mediamtx_whip_url"],
+        "PHONE_ARM_MEDIAMTX_PUBLISH_TOKEN": state["mediamtx_publish_token"],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        "".join(f"export {key}={shlex.quote(str(value))}\n" for key, value in values.items())
+    )
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
+
+
+def create(state_path: Path, env_path: Path, *, listed: bool = False) -> dict:
+    follower_id = os.environ.get("PHONE_ARM_FOLLOWER_ID", socket.gethostname())
+    name = os.environ.get("PHONE_ARM_ROBOT_NAME", follower_id)
+    edge = choose_edge()
+    result = _post(
+        "/api/follower/create",
+        {"follower_id": follower_id, "name": name, "listed": listed, "edge": edge},
+    )
+    result.update({"follower_id": follower_id, "name": name, "listed": listed, "edge": edge})
+    _atomic_json(state_path, result)
+    _write_env(env_path, result)
+    return result
+
+
+def register(state: dict) -> dict:
+    return _post(
+        "/api/follower/register",
+        {
+            "session": state["session"],
+            "follower_id": state["follower_id"],
+            "name": state["name"],
+            "listed": state["listed"],
+        },
+        str(state["registration_token"]),
+    )
+
+
+def heartbeat(state_path: Path, interval_s: float) -> None:
+    state = json.loads(state_path.read_text())
     failures = 0
     while True:
         try:
-            register()
+            register(state)
             if failures:
                 print("[access] hosted API connection restored", flush=True)
             failures = 0
         except Exception as exc:  # noqa: BLE001 - heartbeat must keep retrying
             failures += 1
             if failures == 1 or failures % 12 == 0:
-                print(f"[access] hosted API heartbeat failed: {exc}", file=sys.stderr, flush=True)
+                print(
+                    f"[access] hosted API heartbeat failed: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         time.sleep(interval_s)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    register_parser = subparsers.add_parser("register")
-    register_parser.add_argument("--mint-name")
-    register_parser.add_argument("--expires-s", type=float, default=7200)
+    create_parser = subparsers.add_parser("create")
+    create_parser.add_argument("--state", type=Path, required=True)
+    create_parser.add_argument("--env-file", type=Path, required=True)
+    create_parser.add_argument("--listed", action="store_true")
     heartbeat_parser = subparsers.add_parser("heartbeat")
+    heartbeat_parser.add_argument("--state", type=Path, required=True)
     heartbeat_parser.add_argument("--interval", type=float, default=5.0)
     args = parser.parse_args()
 
-    if args.command == "register":
-        result = register(args.mint_name, args.expires_s)
-        if result.get("share_url"):
-            print("[access] two-hour operator link:")
-            print(result["share_url"])
-        else:
-            print("[access] follower registered with hosted API")
+    if args.command == "create":
+        result = create(args.state, args.env_file, listed=args.listed)
+        print("[access] two-hour control link:")
+        print(result["share_url"])
+        print(f"[access] nearest relay edge: {result['edge']}")
         return
-    heartbeat(max(1.0, args.interval))
+    heartbeat(args.state, max(1.0, args.interval))
 
 
 if __name__ == "__main__":

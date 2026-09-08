@@ -21,19 +21,16 @@ which arm should be the follower. Its normal calibration ID is derived from the
 selected adapter serial. The menu marks arms whose calibration file is missing;
 LeRobot's calibration flow runs after selection when one is required.
 
-The existing London relay, public page, MediaMTX video service and Singapore
-edge can be reused by another follower, but the deployment is currently
-one-to-one: only one follower may own the `default` control session and `robot`
-video path at a time. Stop the current follower before connecting its
-replacement.
-
-The replacement machine must be provisioned with the existing TURN, control
-relay and MediaMTX credentials. Do not generate independent credentials on the
-follower; they must match the hosted services. No inbound port, TLS certificate,
-SSH key or tunnel is required on the follower. Every `run.sh` startup registers
-the follower outbound, creates a fresh two-hour browser token on the VPS, and
-prints the complete share URL.
+No secrets, account, inbound port, TLS certificate, SSH key or tunnel are
+required on a follower. Each `run.sh` creates a new anonymous robot session.
+The server returns private, session-scoped runtime capabilities and `run.sh`
+prints one two-hour control invitation, for example:
 
 ```sh
-./follower/run.sh
+https://188-166-154-201.sslip.io/robot/r_example#access=...
 ```
+
+The invitation secret is after `#`, so it is not included in normal HTTP access
+logs. Anyone with the complete link can control that robot. Sessions are
+unlisted by default; startup asks before publishing the robot in the public
+directory. Multiple followers use independent control and video paths.

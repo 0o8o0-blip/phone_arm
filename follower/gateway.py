@@ -661,16 +661,12 @@ def _default_video_device() -> str:
 # Robot camera video. This is deliberately the robot camera stream shown
 # over the WebXR AR passthrough so the phone camera is not visible to the user.
 VIDEO_DEVICE = _default_video_device()
-# Browser WHEP media is RELAY-ONLY: it always flows through the VPS TURN relay,
-# never a direct LAN/host path or a public srflx path. TURN is therefore
-# mandatory for remote video. follower/run.sh supplies these from ~/.turn_secret.
+# Static TURN settings are used only by the local development server below.
+# Hosted sessions receive temporary regional TURN credentials from the VPS API.
 TURN_URL = _os.environ.get("PHONE_ARM_TURN_URL", "")
 TURN_USER = _os.environ.get("PHONE_ARM_TURN_USER", "")
 TURN_PW = _os.environ.get("PHONE_ARM_TURN_PW", "")
-# Phone-facing TURN URL: when the operator should hit a DIFFERENT coturn than
-# the Pi (two-edge video routing -- e.g. operator hits SGP coturn near them
-# while Pi uses London coturn over LAN), set this. Unset -> phone uses
-# TURN_URL too (single-coturn topology).
+# Optional phone-facing override for the local development server.
 TURN_URL_PHONE = _os.environ.get("PHONE_ARM_TURN_URL_PHONE", "") or TURN_URL
 ALLOW_NO_TURN_FOR_LOCAL_REPRO = (
     _os.environ.get("PHONE_ARM_ALLOW_NO_TURN_FOR_LOCAL_REPRO", "").strip() == "1"
@@ -2204,6 +2200,10 @@ class BrowserPhone:
                 f"transport={data.get('transport', 'ws')}"
             )
             return
+        # The session ID is a routing label rather than a secret, but still
+        # reject a relay message stamped for any other robot session.
+        if data.get("_relay_session") != SESSION_RELAY_SESSION:
+            return
         if "seq" not in data:
             return
 
@@ -2976,17 +2976,6 @@ class BrowserPhone:
 
     async def _start_server(self) -> None:
         if HOSTED_API_URL:
-            if not TURN_URL and not ALLOW_NO_TURN_FOR_LOCAL_REPRO:
-                raise RuntimeError(
-                    "WHEP video is relay-only but no TURN server is configured. "
-                    "follower/run.sh supplies PHONE_ARM_TURN_URL/USER/PW from ~/.turn_secret."
-                )
-            if ((not MEDIAMTX_WHEP_URL or not MEDIAMTX_PLAY_TOKEN)
-                    and not ALLOW_NO_TURN_FOR_LOCAL_REPRO):
-                raise RuntimeError(
-                    "WHEP video is enabled in the browser but MediaMTX config is missing. "
-                    "follower/run.sh supplies PHONE_ARM_MEDIAMTX_WHEP_URL/PLAY_TOKEN."
-                )
             print(
                 f"[browser_phone] hosted web API={HOSTED_API_URL}; "
                 "local HTTPS disabled"
@@ -3029,7 +3018,7 @@ class BrowserPhone:
         app.router.add_get("/webrtc/config", self._webrtc_config)
         app.router.add_get("/leader/config", self._leader_config)
         app.router.add_post("/control/release", self._control_release)
-        print(f"[browser_phone] robot_video=WHEP(MediaMTX relay-only) "
+        print(f"[browser_phone] robot_video=WHEP(MediaMTX local fallback) "
               f"device={VIDEO_DEVICE} "
               f"cameras={[k for k, _l, _d in _present_cameras()]} "
               f"turn={TURN_URL} control=relay-webtransport")
@@ -3104,11 +3093,8 @@ class BrowserPhone:
 
     # --- Robot camera video ---------------------------------------------
     def _ice_servers_json(self) -> list[dict]:
-        # Relay-only: TURN is the SOLE ICE server. No STUN -- a srflx candidate
-        # would only enable a direct (non-VPS) path, which we deliberately
-        # forbid (iceTransportPolicy=relay on the client drops it anyway).
-        # Prefer failing fast over silently falling back to TURN-over-TCP,
-        # which can add head-of-line blocking and high latency.
+        # The local development server retains its older static TURN setup.
+        # Hosted production configuration is issued by server/api.py instead.
         if not TURN_URLS_PHONE:
             return []
         return [{"urls": TURN_URLS_PHONE, "username": TURN_USER, "credential": TURN_PW}]

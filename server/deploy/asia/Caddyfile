@@ -1,0 +1,5 @@
+146-190-104-81.sslip.io {
+	header Access-Control-Allow-Origin "*"
+	header Cache-Control "no-store"
+	respond "phone-arm Asia edge\n" 200
+}

@@ -222,53 +222,32 @@ _start_whip_publisher_supervisor() {
   done
 }
 
-# Operator page/signaling are served through the London VPS
-# (188.166.154.201). Video remains WebRTC relay-only, but the Pi and phone can
-# use different TURN edges: Pi uses London, while the operator phone defaults to
-# Singapore below. TURN creds are REQUIRED for video -- the server refuses to
-# start video without them. Password is read from ~/.turn_secret (not committed).
-# Pi uses London coturn directly (~4ms RTT) for its own video relay candidate.
-# The operator's phone hits the Singapore coturn instead -- see
-# PHONE_ARM_TURN_URL_PHONE below. Standard TURN permissions handle the
-# cross-server traffic: when one side sends to the other's relay-candidate
-# address, its coturn forwards UDP from the other coturn's external IP.
-export PHONE_ARM_TURN_URL="${PHONE_ARM_TURN_URL:-turn:188.166.154.201:3478?transport=udp}"
-export PHONE_ARM_TURN_URL_PHONE="${PHONE_ARM_TURN_URL_PHONE:-turn:146.190.104.81:3478?transport=udp}"
-export PHONE_ARM_TURN_USER="${PHONE_ARM_TURN_USER:-teleop}"
-export PHONE_ARM_TURN_PW="${PHONE_ARM_TURN_PW:-$(cat "$HOME/.turn_secret")}"
-
-# Control commands ride WebTransport datagrams via the session relay. The
-# relay keeps delivery latest-only and independent of the video/signaling
-# path. Tokens are kept out of git; override these env vars to test different
-# relays.
-#
-# Pi connects directly to the London relay over its local-ISP path (~4ms RTT).
-# The operator's phone hits the Singapore forwarder (see
-# PHONE_ARM_SESSION_RELAY_WT_URL_PHONE below) which tunnels into this same
-# London relay over a persistent QUIC connection between the two DO
-# datacenters.
-export PHONE_ARM_SESSION_RELAY_WT_URL="${PHONE_ARM_SESSION_RELAY_WT_URL:-https://188-166-154-201.sslip.io:4433/wt}"
-export PHONE_ARM_SESSION_RELAY_WT_URL_PHONE="${PHONE_ARM_SESSION_RELAY_WT_URL_PHONE:-https://146-190-104-81.sslip.io:4434/wt}"
-export PHONE_ARM_SESSION_RELAY_SESSION="${PHONE_ARM_SESSION_RELAY_SESSION:-default}"
-export PHONE_ARM_SESSION_RELAY_ARM_TOKEN="${PHONE_ARM_SESSION_RELAY_ARM_TOKEN:-$(cat "$HOME/.phone_arm_relay_arm_token")}"
-export PHONE_ARM_SESSION_RELAY_PHONE_TOKEN="${PHONE_ARM_SESSION_RELAY_PHONE_TOKEN:-$(cat "$HOME/.phone_arm_relay_phone_token")}"
 export PHONE_ARM_HOSTED_API_URL="${PHONE_ARM_HOSTED_API_URL:-https://188-166-154-201.sslip.io}"
 
-# MediaMTX SFU for robot video. /webrtc/config advertises the WHEP endpoint
-# + subscriber token so the browser can subscribe directly to the SFU on the
-# VPS. If the play secret is absent, the browser has no robot-video fallback.
-if [ -r "$HOME/.phone_arm_secrets/mediamtx_play_pw" ]; then
-  export PHONE_ARM_MEDIAMTX_WHEP_URL="${PHONE_ARM_MEDIAMTX_WHEP_URL:-https://188-166-154-201.sslip.io/robot/whep}"
-  export PHONE_ARM_MEDIAMTX_PLAY_TOKEN="${PHONE_ARM_MEDIAMTX_PLAY_TOKEN:-$(cat "$HOME/.phone_arm_secrets/mediamtx_play_pw")}"
+# Anonymous creation returns a private robot capability and one two-hour
+# control invitation. These runtime credentials live only in this run's log
+# directory; a new machine needs no copied secret files.
+SESSION_STATE="$LOG_DIR/hosted_session_$PHONE_ARM_RUN_ID.json"
+SESSION_ENV="$LOG_DIR/hosted_session_$PHONE_ARM_RUN_ID.env"
+CREATE_ARGS=(create --state "$SESSION_STATE" --env-file "$SESSION_ENV")
+LISTED_CHOICE="${PHONE_ARM_LISTED:-}"
+if [ -z "$LISTED_CHOICE" ] && [ -t 0 ]; then
+  read -r -p "List this robot publicly? [y/N] " LISTED_CHOICE
 fi
-
-# Register this follower with the VPS and create one short-lived browser link.
-# The VPS owns browser tokens; relay and media credentials remain on the two
-# machines that need them and are held only in API memory.
-echo "[access] creating a two-hour operator link"
-"$PYTHON_BIN" -m follower.hosted_api register \
-  --mint-name "startup-$PHONE_ARM_RUN_ID" \
-  --expires-s 7200
+case "$LISTED_CHOICE" in
+  1|y|Y|yes|YES) CREATE_ARGS+=(--listed) ;;
+esac
+if [ "${#CREATE_ARGS[@]}" -eq 5 ]; then
+  echo "[access] robot listing=unlisted"
+else
+  echo "[access] robot listing=public"
+fi
+echo "[access] creating robot session"
+"$PYTHON_BIN" -m follower.hosted_api "${CREATE_ARGS[@]}"
+# The generated file contains only values returned by our authenticated HTTPS
+# endpoint and is mode 0600.
+. "$SESSION_ENV"
+rm -f "$SESSION_ENV"
 echo
 
 HOSTED_API_PID=""
@@ -280,14 +259,14 @@ if [ "${PHONE_ARM_METRICS:-1}" != "0" ]; then
   echo "[run] system metrics logging to $METRICS every ${PHONE_ARM_METRICS_INTERVAL_S:-5}s (run_id=$PHONE_ARM_RUN_ID)"
 fi
 
-# --- WHIP publisher (only when PHONE_ARM_MEDIAMTX_WHEP_URL is enabled) ---
+# --- Session-scoped WHIP publisher ---
 # ffmpeg pulls MJPG frames off the camera, re-encodes as H.264 baseline
 # (Chrome's HW-decode-friendly profile), pushes it over RTSP-UDP to a local
 # whipinto instance.
 WHIP_SUPERVISOR_PID=""
-if [ -n "${PHONE_ARM_MEDIAMTX_WHEP_URL:-}" ] \
-   && [ -r "$HOME/.phone_arm_secrets/mediamtx_publish_pw" ]; then
-  MTX_PUB=$(cat "$HOME/.phone_arm_secrets/mediamtx_publish_pw")
+if [ -n "${PHONE_ARM_MEDIAMTX_WHIP_URL:-}" ] \
+   && [ -n "${PHONE_ARM_MEDIAMTX_PUBLISH_TOKEN:-}" ]; then
+  MTX_PUB="$PHONE_ARM_MEDIAMTX_PUBLISH_TOKEN"
   # Resolve the default video device via the follower gateway's camera logic
   # uses so the publisher tracks any camera reordering. Import-time
   # warnings go to stdout via third-party libs; take the LAST line only.
@@ -305,7 +284,7 @@ if [ -n "${PHONE_ARM_MEDIAMTX_WHEP_URL:-}" ] \
     DEV=""
   fi
   if [ -n "$DEV_ARGS" ]; then
-    WHIP_WHIP="${PHONE_ARM_MEDIAMTX_WHIP_URL:-https://188-166-154-201.sslip.io/robot/whip}"
+    WHIP_WHIP="$PHONE_ARM_MEDIAMTX_WHIP_URL"
     _start_whip_publisher_supervisor "$DEV_ARGS" "${DEV:-testsrc}" "$WHIP_WHIP" "$MTX_PUB" &
     WHIP_SUPERVISOR_PID=$!
     echo "[whip] supervisor pid=$WHIP_SUPERVISOR_PID log=$VIDEO_SUPERVISOR_LOG"
@@ -328,7 +307,7 @@ _cleanup() {
 }
 trap _cleanup EXIT
 
-"$PYTHON_BIN" -u -m follower.hosted_api heartbeat &
+"$PYTHON_BIN" -u -m follower.hosted_api heartbeat --state "$SESSION_STATE" &
 HOSTED_API_PID=$!
 
 # follower.main records per-frame phone / desired-EE / measured-EE to

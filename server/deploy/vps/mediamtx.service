@@ -8,9 +8,6 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/opt/mediamtx
-# Passwords + TURN_PW live outside the unit so they're not visible in
-# `systemctl cat`. Chmod 600, owned by root.
-EnvironmentFile=/root/.mediamtx_secrets
 ExecStart=/opt/mediamtx/mediamtx /opt/mediamtx/mediamtx.yml
 Restart=on-failure
 RestartSec=3

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""VPS web API for follower registration and browser access."""
+"""Hosted session authority for anonymously created Phone Arm robots."""
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import hmac
 import json
 import os
@@ -12,20 +14,22 @@ import shlex
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from aiohttp import web
 
+try:
+    from .capabilities import issue as issue_capability
+    from .capabilities import verify as verify_capability
+except ImportError:  # Direct deployment alongside capabilities.py.
+    from capabilities import issue as issue_capability
+    from capabilities import verify as verify_capability
 
-SESSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+
+SESSION_RE = re.compile(r"^r_[A-Za-z0-9_-]{12,40}$")
 OWNER_TIMEOUT_S = 8.0
-CONFIG_KEYS = {
-    "iceServers",
-    "iceTransportPolicy",
-    "mediamtxWhepUrl",
-    "mediamtxPlayToken",
-    "phoneRelayWtUrl",
-    "leaderRelayWtUrl",
-}
+CREATE_LIMIT_PER_HOUR = 12
+MAX_ACTIVE_FOLLOWERS = 100
 
 
 def read_secret_arg(value: str) -> str:
@@ -34,24 +38,42 @@ def read_secret_arg(value: str) -> str:
     return value.strip()
 
 
+def _bearer(request: web.Request) -> str:
+    value = request.headers.get("Authorization", "")
+    return value[7:].strip() if value.startswith("Bearer ") else ""
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 class SessionApi:
     def __init__(
         self,
         *,
-        arm_secret: str,
+        capability_secret: str,
+        turn_secret: str,
         public_url: str,
+        relay_urls: dict[str, str],
+        turn_urls: dict[str, str],
         state_file: Path,
         event_log: Path | None,
         follower_timeout_s: float,
+        session_lifetime_s: float,
     ) -> None:
-        self.arm_secret = arm_secret
+        self.capability_secret = capability_secret
+        self.turn_secret = turn_secret
         self.public_url = public_url.rstrip("/")
+        self.relay_urls = {key: value.rstrip("/") for key, value in relay_urls.items()}
+        self.turn_urls = turn_urls
         self.state_file = state_file
         self.event_log = event_log
         self.follower_timeout_s = follower_timeout_s
+        self.session_lifetime_s = session_lifetime_s
         self.tokens = self._load_tokens()
         self.followers: dict[str, dict[str, Any]] = {}
         self.owners: dict[str, dict[str, Any]] = {}
+        self.creates_by_address: dict[str, list[float]] = {}
 
     def _load_tokens(self) -> list[dict[str, Any]]:
         try:
@@ -81,36 +103,95 @@ class SessionApi:
         with self.event_log.open("a") as output:
             output.write(json.dumps(record, separators=(",", ":")) + "\n")
 
-    def _follower_authorized(self, request: web.Request) -> bool:
-        authorization = request.headers.get("Authorization", "")
-        supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
-        return hmac.compare_digest(supplied, self.arm_secret)
+    def _active(self, follower: dict[str, Any], now: float | None = None) -> bool:
+        current = time.time() if now is None else now
+        return (
+            current - float(follower["seen_at"]) <= self.follower_timeout_s
+            and current < float(follower["expires_at"])
+        )
 
-    def _token(self, value: str | None) -> dict[str, Any] | None:
+    def _remote_address(self, request: web.Request) -> str:
+        forwarded = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+        return forwarded or request.remote or "unknown"
+
+    def _check_create_rate(self, request: web.Request) -> None:
+        now = time.time()
+        address = self._remote_address(request)
+        recent = [stamp for stamp in self.creates_by_address.get(address, []) if now - stamp < 3600]
+        if len(recent) >= CREATE_LIMIT_PER_HOUR:
+            raise web.HTTPTooManyRequests(text="robot creation rate limit reached\n")
+        recent.append(now)
+        self.creates_by_address[address] = recent
+        if sum(self._active(item, now) for item in self.followers.values()) >= MAX_ACTIVE_FOLLOWERS:
+            raise web.HTTPServiceUnavailable(text="robot capacity reached\n")
+
+    def _capability(self, role: str, session: str, expires_at: float) -> str:
+        return issue_capability(
+            self.capability_secret,
+            role=role,
+            session=session,
+            expires_at=expires_at,
+        )
+
+    @staticmethod
+    def _edge(value: Any) -> str:
+        return "asia" if str(value or "").lower() == "asia" else "europe"
+
+    @staticmethod
+    def _relay_endpoint(base: str, role: str, session: str, token: str) -> str:
+        if base.startswith("wss://"):
+            base = "https://" + base[len("wss://") :]
+        base = base.rstrip("/")
+        if base.endswith(("/phone", "/arm")):
+            base = base.rsplit("/", 1)[0]
+        elif not base.endswith("/wt"):
+            base += "/wt"
+        return f"{base}/{role}?{urlencode({'session': session, 'token': token})}"
+
+    def _mint_access(self, *, session: str, expires_at: float) -> str:
+        now = time.time()
+        self.tokens = [
+            entry
+            for entry in self.tokens
+            if float(entry.get("expires_at") or 0) > now
+        ]
+        token = secrets.token_urlsafe(32)
+        self.tokens.append(
+            {
+                "name": "invite",
+                "session": session,
+                "hash": _token_hash(token),
+                "expires_at": expires_at,
+            }
+        )
+        self._save_tokens()
+        return token
+
+    def _access_token(self, value: str | None) -> dict[str, Any] | None:
         if not value:
             return None
+        wanted_hash = _token_hash(value)
         now = time.time()
         for entry in self.tokens:
-            if not hmac.compare_digest(str(entry.get("value", "")), value):
-                continue
-            expires_at = entry.get("expires_at")
-            if expires_at is not None and float(expires_at) <= now:
-                return None
-            return entry
+            stored_hash = str(entry.get("hash") or "")
+            legacy_value = str(entry.get("value") or "")
+            matches = (
+                bool(stored_hash) and hmac.compare_digest(stored_hash, wanted_hash)
+            ) or (
+                bool(legacy_value) and hmac.compare_digest(legacy_value, value)
+            )
+            if matches and float(entry.get("expires_at") or 0) > now:
+                return entry
         return None
 
-    def _browser_context(
-        self, request: web.Request
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        token = self._token(request.query.get("t"))
+    def _browser_context(self, request: web.Request) -> tuple[dict[str, Any], dict[str, Any]]:
+        token = self._access_token(_bearer(request) or request.query.get("t"))
         if token is None:
-            raise web.HTTPUnauthorized(text="invalid or missing token\n")
-        session = str(token.get("session") or "default")
+            raise web.HTTPUnauthorized(text="invalid or missing invitation token\n")
+        session = str(token.get("session") or "")
         follower = self.followers.get(session)
-        if follower is None:
-            raise web.HTTPServiceUnavailable(text="follower is not registered\n")
-        if time.time() - float(follower["seen_at"]) > self.follower_timeout_s:
-            raise web.HTTPServiceUnavailable(text="follower registration is stale\n")
+        if follower is None or not self._active(follower):
+            raise web.HTTPServiceUnavailable(text="robot is offline\n")
         return token, follower
 
     @staticmethod
@@ -123,143 +204,155 @@ class SessionApi:
         ).strip()
         return value[:80] or None
 
-    def _mint(
-        self, *, name: str, session: str, expires_s: float
-    ) -> dict[str, Any]:
+    async def create_follower(self, request: web.Request) -> web.Response:
+        self._check_create_rate(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="request must be an object\n")
         now = time.time()
-        self.tokens = [
-            token
-            for token in self.tokens
-            if token.get("expires_at") is None or float(token["expires_at"]) > now
-        ]
-        if any(token.get("name") == name for token in self.tokens):
-            raise web.HTTPConflict(text=f"token name already exists: {name}\n")
-        entry = {
-            "name": name,
+        session = "r_" + secrets.token_urlsafe(12)
+        expires_at = now + self.session_lifetime_s
+        access_expires_at = min(expires_at, now + 7200)
+        follower_id = str(body.get("follower_id") or "robot")[:120]
+        display_name = str(body.get("name") or follower_id)[:80]
+        listed = bool(body.get("listed", False))
+        edge = self._edge(body.get("edge"))
+        registration_token = self._capability("register", session, expires_at)
+        arm_token = self._capability("arm", session, expires_at)
+        publish_token = self._capability("media-publish", session, expires_at)
+        access_token = self._mint_access(session=session, expires_at=access_expires_at)
+        self.followers[session] = {
             "session": session,
-            "value": secrets.token_urlsafe(32),
-            "expires_at": now + expires_s,
+            "follower_id": follower_id,
+            "name": display_name,
+            "listed": listed,
+            "seen_at": now,
+            "expires_at": expires_at,
         }
-        self.tokens.append(entry)
-        self._save_tokens()
         self._event(
-            "token_minted",
-            {"name": name, "session": session, "expires_s": expires_s},
+            "follower_created",
+            {"session": session, "follower_id": follower_id, "listed": listed},
         )
-        return entry
+        return web.json_response(
+            {
+                "session": session,
+                "registration_token": registration_token,
+                "session_expires_at": expires_at,
+                "edge": edge,
+                "relay_url": self.relay_urls[edge],
+                "arm_relay_token": arm_token,
+                "mediamtx_whip_url": f"{self.public_url}/media/{session}/whip",
+                "mediamtx_publish_token": publish_token,
+                "share_url": f"{self.public_url}/robot/{session}#access={access_token}",
+                "access_expires_at": access_expires_at,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def register(self, request: web.Request) -> web.Response:
-        if not self._follower_authorized(request):
-            raise web.HTTPUnauthorized(text="invalid follower credential\n")
         try:
             body = await request.json()
         except Exception as exc:
             raise web.HTTPBadRequest(text="invalid JSON\n") from exc
-        session = str(body.get("session") or "default")
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="request must be an object\n")
+        session = str(body.get("session") or "")
         if not SESSION_RE.fullmatch(session):
             raise web.HTTPBadRequest(text="invalid session\n")
-        raw_config = body.get("config")
-        if not isinstance(raw_config, dict):
-            raise web.HTTPBadRequest(text="config must be an object\n")
-        config = {
-            key: raw_config[key] for key in CONFIG_KEYS if key in raw_config
-        }
-        required = {
-            "iceServers",
-            "mediamtxWhepUrl",
-            "mediamtxPlayToken",
-            "phoneRelayWtUrl",
-            "leaderRelayWtUrl",
-        }
-        missing = sorted(required - config.keys())
-        if missing:
-            raise web.HTTPBadRequest(
-                text=f"missing config: {', '.join(missing)}\n"
-            )
-        follower_id = str(body.get("follower_id") or "follower")[:120]
-        first_registration = session not in self.followers
-        self.followers[session] = {
-            "session": session,
-            "follower_id": follower_id,
-            "config": config,
-            "seen_at": time.time(),
-        }
-        if first_registration:
-            self._event(
-                "follower_registered",
-                {"session": session, "follower_id": follower_id},
-            )
-        response: dict[str, Any] = {
-            "ok": True,
-            "session": session,
-            "lease_s": self.follower_timeout_s,
-        }
-        mint = body.get("mint")
-        if isinstance(mint, dict):
-            name = str(mint.get("name") or "").strip()[:120]
-            expires_s = float(mint.get("expires_s") or 7200)
-            if not name or not 60 <= expires_s <= 86400 * 30:
-                raise web.HTTPBadRequest(text="invalid token request\n")
-            entry = self._mint(
-                name=name, session=session, expires_s=expires_s
-            )
-            response.update(
-                {
-                    "token_name": name,
-                    "expires_at": entry["expires_at"],
-                    "share_url": f"{self.public_url}/?t={entry['value']}",
-                }
-            )
+        registration_token = _bearer(request)
+        if not verify_capability(
+            self.capability_secret,
+            registration_token,
+            role="register",
+            session=session,
+        ):
+            raise web.HTTPUnauthorized(text="invalid robot capability\n")
+        now = time.time()
+        follower = self.followers.get(session)
+        if follower is None:
+            expiry = int(registration_token.split(".", 2)[1])
+            follower = {
+                "session": session,
+                "follower_id": str(body.get("follower_id") or "robot")[:120],
+                "name": str(body.get("name") or body.get("follower_id") or "robot")[:80],
+                "listed": bool(body.get("listed", False)),
+                "expires_at": expiry,
+            }
+            self.followers[session] = follower
+            self._event("follower_restored", {"session": session})
+        follower["seen_at"] = now
         return web.json_response(
-            response, headers={"Cache-Control": "no-store"}
+            {"ok": True, "session": session, "lease_s": self.follower_timeout_s},
+            headers={"Cache-Control": "no-store"},
         )
+
+    def _turn_credentials(
+        self, session: str, edge: str, expires_at: float
+    ) -> dict[str, Any]:
+        username = f"{int(expires_at)}:{session}"
+        digest = hmac.new(
+            self.turn_secret.encode(), username.encode(), hashlib.sha1
+        ).digest()
+        return {
+            "urls": [
+                self.turn_urls[edge],
+                self.turn_urls["europe" if edge == "asia" else "asia"],
+            ],
+            "username": username,
+            "credential": base64.b64encode(digest).decode(),
+        }
 
     async def webrtc_config(self, request: web.Request) -> web.Response:
         token, follower = self._browser_context(request)
-        config = follower["config"]
+        session = follower["session"]
+        edge = self._edge(request.query.get("edge"))
+        capability_expiry = min(float(token["expires_at"]), time.time() + 3600)
         response: dict[str, Any] = {
-            "iceServers": config["iceServers"],
-            "iceTransportPolicy": config.get(
-                "iceTransportPolicy", "relay"
-            ),
+            "iceServers": [
+                self._turn_credentials(session, edge, capability_expiry)
+            ],
+            "iceTransportPolicy": "all",
             "controlRole": "viewer",
             "controlTransport": "viewer",
-            "mediamtxWhepUrl": config["mediamtxWhepUrl"],
-            "mediamtxPlayToken": config["mediamtxPlayToken"],
+            "mediamtxWhepUrl": f"{self.public_url}/media/{session}/whep",
+            "mediamtxPlayToken": self._capability(
+                "media-view", session, capability_expiry
+            ),
         }
-        wants_control = str(
-            request.query.get("want_control") or ""
-        ).lower() in {"1", "true", "yes", "on", "controller"}
+        wants_control = str(request.query.get("want_control") or "").lower() in {
+            "1", "true", "yes", "on", "controller"
+        }
         if wants_control:
-            session = follower["session"]
             page_id = self._page_id(request)
             now = time.time()
             owner = self.owners.get(session)
             if owner and now - float(owner["seen_at"]) > OWNER_TIMEOUT_S:
                 self.owners.pop(session, None)
                 owner = None
-            if page_id and (
-                owner is None or owner["page_id"] == page_id
-            ):
-                claimed_at = (
-                    now if owner is None else float(owner["claimed_at"])
-                )
+            if page_id and (owner is None or owner["page_id"] == page_id):
+                claimed_at = now if owner is None else float(owner["claimed_at"])
                 self.owners[session] = {
                     "page_id": page_id,
                     "token_name": token.get("name"),
                     "claimed_at": claimed_at,
                     "seen_at": now,
                 }
+                relay_token = self._capability(
+                    "phone", session, capability_expiry
+                )
                 response.update(
                     {
                         "controlRole": "controller",
                         "controlTransport": "relay-webtransport",
                         "controlOwnerPageId": page_id,
-                        "controlOwnerAgeMs": round(
-                            (now - claimed_at) * 1000.0, 1
-                        ),
+                        "controlOwnerAgeMs": round((now - claimed_at) * 1000.0, 1),
                         "controlOwnerTimeoutS": OWNER_TIMEOUT_S,
-                        "sessionRelayWtUrl": config["phoneRelayWtUrl"],
+                        "sessionRelayWtUrl": self._relay_endpoint(
+                            self.relay_urls[edge], "phone", session, relay_token
+                        ),
                         "sessionRelaySession": session,
                     }
                 )
@@ -267,28 +360,43 @@ class SessionApi:
                 response["controlDeniedReason"] = (
                     "missing_page_id" if not page_id else "controller_active"
                 )
-                if owner:
-                    response["controlOwnerPageId"] = owner["page_id"]
-        return web.json_response(
-            response, headers={"Cache-Control": "no-store"}
-        )
+        return web.json_response(response, headers={"Cache-Control": "no-store"})
 
     async def leader_config(self, request: web.Request) -> web.Response:
-        _, follower = self._browser_context(request)
-        relay_url = str(follower["config"]["leaderRelayWtUrl"])
+        token, follower = self._browser_context(request)
+        session = follower["session"]
+        edge = self._edge(request.query.get("edge"))
+        relay_token = self._capability(
+            "phone", session, min(float(token["expires_at"]), time.time() + 3600)
+        )
+        relay_url = self._relay_endpoint(
+            self.relay_urls[edge], "phone", session, relay_token
+        )
         command = (
-            "cd ~/dev/phone_arm && "
-            "./controllers/leader_arm/run.sh --url "
+            "cd ~/dev/phone_arm && ./controllers/leader_arm/run.sh --url "
             + shlex.quote(relay_url)
         )
         return web.json_response(
-            {
-                "mode": "one_to_one",
-                "session": follower["session"],
-                "command": command,
-            },
+            {"mode": "one_to_one", "session": session, "command": command},
             headers={"Cache-Control": "no-store"},
         )
+
+    async def media_authorize(self, request: web.Request) -> web.Response:
+        session = request.headers.get("X-Media-Session", "")
+        action = request.headers.get("X-Media-Action", "")
+        role = {"whip": "media-publish", "whep": "media-view"}.get(action)
+        if (
+            role is None
+            or not SESSION_RE.fullmatch(session)
+            or not verify_capability(
+                self.capability_secret,
+                _bearer(request),
+                role=role,
+                session=session,
+            )
+        ):
+            raise web.HTTPUnauthorized(text="invalid media capability\n")
+        return web.Response(status=204)
 
     async def release(self, request: web.Request) -> web.Response:
         _, follower = self._browser_context(request)
@@ -298,13 +406,9 @@ class SessionApi:
                 body = await request.json()
             except Exception:
                 body = {}
-            page_id = str(
-                body.get("page_id") or body.get("app_page_id") or ""
-            )[:80] or None
+            page_id = str(body.get("page_id") or body.get("app_page_id") or "")[:80] or None
         owner = self.owners.get(follower["session"])
-        released = bool(
-            owner and page_id and owner["page_id"] == page_id
-        )
+        released = bool(owner and page_id and owner["page_id"] == page_id)
         if released:
             self.owners.pop(follower["session"], None)
         return web.json_response({"ok": True, "released": released})
@@ -315,9 +419,7 @@ class SessionApi:
             {
                 "session": follower["session"],
                 "follower_id": follower["follower_id"],
-                "follower_seen_age_ms": round(
-                    (time.time() - follower["seen_at"]) * 1000.0, 1
-                ),
+                "follower_seen_age_ms": round((time.time() - follower["seen_at"]) * 1000.0, 1),
                 "token_name": token.get("name"),
                 "control_owner": self.owners.get(follower["session"]),
             },
@@ -338,20 +440,26 @@ class SessionApi:
         self._event("browser_event", body)
         return web.json_response({"ok": True})
 
+    async def robots(self, _request: web.Request) -> web.Response:
+        now = time.time()
+        robots = [
+            {"session": item["session"], "name": item["name"]}
+            for item in self.followers.values()
+            if item.get("listed") and self._active(item, now)
+        ]
+        return web.json_response({"robots": robots})
+
     async def health(self, _request: web.Request) -> web.Response:
         now = time.time()
-        active = sum(
-            1
-            for follower in self.followers.values()
-            if now - follower["seen_at"] <= self.follower_timeout_s
-        )
-        return web.json_response(
-            {"ok": True, "active_followers": active}
-        )
+        active = sum(self._active(item, now) for item in self.followers.values())
+        return web.json_response({"ok": True, "active_followers": active})
 
     def app(self) -> web.Application:
         app = web.Application(client_max_size=128 * 1024)
+        app.router.add_post("/api/follower/create", self.create_follower)
         app.router.add_post("/api/follower/register", self.register)
+        app.router.add_get("/api/media/authorize", self.media_authorize)
+        app.router.add_get("/api/robots", self.robots)
         app.router.add_get("/webrtc/config", self.webrtc_config)
         app.router.add_get("/leader/config", self.leader_config)
         app.router.add_post("/control/release", self.release)
@@ -365,25 +473,34 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--arm-secret", required=True)
+    parser.add_argument("--capability-secret", required=True)
+    parser.add_argument("--turn-secret", required=True)
     parser.add_argument("--public-url", required=True)
+    parser.add_argument("--relay-url-europe", required=True)
+    parser.add_argument("--relay-url-asia", required=True)
+    parser.add_argument("--turn-url-europe", required=True)
+    parser.add_argument("--turn-url-asia", required=True)
     parser.add_argument("--state-file", type=Path, required=True)
     parser.add_argument("--event-log", type=Path)
     parser.add_argument("--follower-timeout-s", type=float, default=20.0)
+    parser.add_argument("--session-lifetime-s", type=float, default=86400.0)
     args = parser.parse_args()
-    arm_secret = read_secret_arg(args.arm_secret)
-    if not arm_secret:
-        parser.error("arm secret must not be empty")
+    capability_secret = read_secret_arg(args.capability_secret)
+    turn_secret = read_secret_arg(args.turn_secret)
+    if not capability_secret or not turn_secret:
+        parser.error("capability and TURN secrets must not be empty")
     api = SessionApi(
-        arm_secret=arm_secret,
+        capability_secret=capability_secret,
+        turn_secret=turn_secret,
         public_url=args.public_url,
+        relay_urls={"europe": args.relay_url_europe, "asia": args.relay_url_asia},
+        turn_urls={"europe": args.turn_url_europe, "asia": args.turn_url_asia},
         state_file=args.state_file,
         event_log=args.event_log,
         follower_timeout_s=max(5.0, args.follower_timeout_s),
+        session_lifetime_s=max(300.0, args.session_lifetime_s),
     )
-    web.run_app(
-        api.app(), host=args.host, port=args.port, access_log=None
-    )
+    web.run_app(api.app(), host=args.host, port=args.port, access_log=None)
 
 
 if __name__ == "__main__":
