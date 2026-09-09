@@ -38,3 +38,7 @@ directory. Multiple followers use independent control and video paths.
 Startup also lists every detected camera and a **No camera** option. The chosen
 camera is published for that session. With **No camera**, arm control still
 works and the browser reports that video is unavailable without retrying it.
+
+Hosted session creation retries transient network and server failures three
+times before aborting. Authentication, rate-limit and malformed-request errors
+still fail immediately because retrying cannot resolve them.

@@ -52,20 +52,42 @@ def _post(path: str, body: dict, token: str = "") -> dict:
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    request = Request(
-        api_url + path,
-        data=json.dumps(body).encode(),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=10) as response:
-            return json.load(response)
-    except HTTPError as exc:
-        detail = exc.read(2048).decode(errors="replace").strip()
-        raise RuntimeError(f"hosted API returned HTTP {exc.code}: {detail}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"could not reach hosted API: {exc.reason}") from exc
+    encoded_body = json.dumps(body).encode()
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        request = Request(
+            api_url + path,
+            data=encoded_body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=15) as response:
+                return json.load(response)
+        except HTTPError as exc:
+            detail = exc.read(2048).decode(errors="replace").strip()
+            # Authentication, rate-limit and validation failures need operator
+            # action. Only retry server-side failures that may be transient.
+            if exc.code < 500 or attempt == 3:
+                raise RuntimeError(
+                    f"hosted API returned HTTP {exc.code}: {detail}"
+                ) from exc
+            last_error = exc
+        except (URLError, TimeoutError) as exc:
+            last_error = exc
+            if attempt == 3:
+                break
+        delay_s = 2 ** (attempt - 1)
+        reason = getattr(last_error, "reason", last_error)
+        print(
+            f"[access] hosted API attempt {attempt}/3 failed: {reason}; "
+            f"retrying in {delay_s}s",
+            file=sys.stderr,
+            flush=True,
+        )
+        time.sleep(delay_s)
+    reason = getattr(last_error, "reason", last_error)
+    raise RuntimeError(f"could not reach hosted API after 3 attempts: {reason}")
 
 
 def _atomic_json(path: Path, value: dict) -> None:
