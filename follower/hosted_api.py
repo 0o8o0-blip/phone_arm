@@ -84,8 +84,8 @@ def _write_env(path: Path, state: dict) -> None:
         "PHONE_ARM_SESSION_RELAY_SESSION": state["session"],
         "PHONE_ARM_SESSION_RELAY_WT_URL": state["relay_url"],
         "PHONE_ARM_SESSION_RELAY_ARM_TOKEN": state["arm_relay_token"],
-        "PHONE_ARM_MEDIAMTX_WHIP_URL": state["mediamtx_whip_url"],
-        "PHONE_ARM_MEDIAMTX_PUBLISH_TOKEN": state["mediamtx_publish_token"],
+        "PHONE_ARM_MEDIAMTX_WHIP_URL": state.get("mediamtx_whip_url", ""),
+        "PHONE_ARM_MEDIAMTX_PUBLISH_TOKEN": state.get("mediamtx_publish_token", ""),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -99,12 +99,29 @@ def _write_env(path: Path, state: dict) -> None:
 def create(state_path: Path, env_path: Path, *, listed: bool = False) -> dict:
     follower_id = os.environ.get("PHONE_ARM_FOLLOWER_ID", socket.gethostname())
     name = os.environ.get("PHONE_ARM_ROBOT_NAME", follower_id)
+    video_available = os.environ.get(
+        "PHONE_ARM_VIDEO_AVAILABLE", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}
     edge = choose_edge()
     result = _post(
         "/api/follower/create",
-        {"follower_id": follower_id, "name": name, "listed": listed, "edge": edge},
+        {
+            "follower_id": follower_id,
+            "name": name,
+            "listed": listed,
+            "video_available": video_available,
+            "edge": edge,
+        },
     )
-    result.update({"follower_id": follower_id, "name": name, "listed": listed, "edge": edge})
+    result.update(
+        {
+            "follower_id": follower_id,
+            "name": name,
+            "listed": listed,
+            "video_available": video_available,
+            "edge": edge,
+        }
+    )
     _atomic_json(state_path, result)
     _write_env(env_path, result)
     return result
@@ -118,6 +135,7 @@ def register(state: dict) -> dict:
             "follower_id": state["follower_id"],
             "name": state["name"],
             "listed": state["listed"],
+            "video_available": state.get("video_available", True),
         },
         str(state["registration_token"]),
     )

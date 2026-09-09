@@ -650,7 +650,17 @@ _CAMERA_REGISTRY: list[tuple[str, str, str]] = [
 
 
 def _present_cameras() -> list[tuple[str, str, str]]:
-    return [c for c in _CAMERA_REGISTRY if Path(c[2]).exists()]
+    cameras = [c for c in _CAMERA_REGISTRY if Path(c[2]).exists()]
+    known_targets = {str(Path(path).resolve()) for _key, _label, path in cameras}
+    by_path = Path("/dev/v4l/by-path")
+    if by_path.is_dir():
+        for device in sorted(by_path.glob("*-video-index0")):
+            target = str(device.resolve())
+            if target in known_targets:
+                continue
+            cameras.append((device.stem, device.name, str(device)))
+            known_targets.add(target)
+    return cameras
 
 
 def _default_video_device() -> str:

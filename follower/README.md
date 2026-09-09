@@ -34,3 +34,7 @@ The invitation secret is after `#`, so it is not included in normal HTTP access
 logs. Anyone with the complete link can control that robot. Sessions are
 unlisted by default; startup asks before publishing the robot in the public
 directory. Multiple followers use independent control and video paths.
+
+Startup also lists every detected camera and a **No camera** option. The chosen
+camera is published for that session. With **No camera**, arm control still
+works and the browser reports that video is unavailable without retrying it.

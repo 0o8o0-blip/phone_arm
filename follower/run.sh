@@ -224,6 +224,72 @@ _start_whip_publisher_supervisor() {
 
 export PHONE_ARM_HOSTED_API_URL="${PHONE_ARM_HOSTED_API_URL:-https://188-166-154-201.sslip.io}"
 
+# Select the camera before creating the hosted session so the browser knows
+# whether it should start video at all. Stable /dev/v4l/by-path devices are
+# preferred by follower.gateway; arbitrary additional index-0 cameras are also
+# included. The final menu item deliberately disables video.
+SELECTED_VIDEO_DEVICE=""
+if [ -n "${PHONE_ARM_WHIP_INPUT_ARGS:-}" ]; then
+  export PHONE_ARM_VIDEO_AVAILABLE=1
+  echo "[video] using configured test input"
+else
+  mapfile -t CAMERA_ROWS < <(
+    "$PYTHON_BIN" -c \
+      'from follower.gateway import _present_cameras
+for key, label, path in _present_cameras():
+    print(f"CAMERA\t{key}\t{label}\t{path}")' \
+      2>/dev/null | sed -n '/^CAMERA\t/p'
+  )
+  CAMERA_INDEX=-1
+  if [ "${#CAMERA_ROWS[@]}" -eq 0 ]; then
+    echo "[video] no cameras detected; video disabled"
+  elif [ -t 0 ]; then
+    echo
+    echo "Select robot camera:"
+    for i in "${!CAMERA_ROWS[@]}"; do
+      IFS=$'\t' read -r _camera_marker _camera_key camera_label camera_path \
+        <<<"${CAMERA_ROWS[$i]}"
+      printf '  %d) %s (%s)\n' "$((i + 1))" "$camera_label" "$camera_path"
+    done
+    NO_CAMERA_INDEX=$((${#CAMERA_ROWS[@]} + 1))
+    printf '  %d) No camera\n' "$NO_CAMERA_INDEX"
+    while true; do
+      read -r -p "Camera [1]: " CAMERA_CHOICE
+      CAMERA_CHOICE="${CAMERA_CHOICE:-1}"
+      if [[ "$CAMERA_CHOICE" =~ ^[0-9]+$ ]] \
+         && [ "$CAMERA_CHOICE" -ge 1 ] \
+         && [ "$CAMERA_CHOICE" -le "$NO_CAMERA_INDEX" ]; then
+        if [ "$CAMERA_CHOICE" -lt "$NO_CAMERA_INDEX" ]; then
+          CAMERA_INDEX=$((CAMERA_CHOICE - 1))
+        fi
+        break
+      fi
+      echo "Choose a number from 1 to $NO_CAMERA_INDEX."
+    done
+  else
+    CAMERA_INDEX=0
+    echo "[video] non-interactive startup; selecting first detected camera"
+  fi
+
+  if [ "$CAMERA_INDEX" -ge 0 ]; then
+    IFS=$'\t' read -r _camera_marker _camera_key SELECTED_VIDEO_LABEL \
+      SELECTED_VIDEO_DEVICE <<<"${CAMERA_ROWS[$CAMERA_INDEX]}"
+    export PHONE_ARM_VIDEO_AVAILABLE=1
+    echo "[video] selected $SELECTED_VIDEO_LABEL ($SELECTED_VIDEO_DEVICE)"
+  else
+    export PHONE_ARM_VIDEO_AVAILABLE=0
+    echo "[video] session will run without video"
+  fi
+fi
+if [ "$PHONE_ARM_VIDEO_AVAILABLE" = "1" ]; then
+  if ! command -v whipinto >/dev/null 2>&1 \
+     || ! command -v ffmpeg >/dev/null 2>&1; then
+    export PHONE_ARM_VIDEO_AVAILABLE=0
+    SELECTED_VIDEO_DEVICE=""
+    echo "[video] ffmpeg or whipinto is missing; session will run without video"
+  fi
+fi
+
 # Anonymous creation returns a private robot capability and one two-hour
 # control invitation. These runtime credentials live only in this run's log
 # directory; a new machine needs no copied secret files.
@@ -267,11 +333,7 @@ WHIP_SUPERVISOR_PID=""
 if [ -n "${PHONE_ARM_MEDIAMTX_WHIP_URL:-}" ] \
    && [ -n "${PHONE_ARM_MEDIAMTX_PUBLISH_TOKEN:-}" ]; then
   MTX_PUB="$PHONE_ARM_MEDIAMTX_PUBLISH_TOKEN"
-  # Resolve the default video device via the follower gateway's camera logic
-  # uses so the publisher tracks any camera reordering. Import-time
-  # warnings go to stdout via third-party libs; take the LAST line only.
-  DEV=$("$PYTHON_BIN" -c \
-      'from follower import gateway; print(gateway.VIDEO_DEVICE)' 2>/dev/null | tail -1)
+  DEV="$SELECTED_VIDEO_DEVICE"
   # Override the auto-resolved device for testing without hardware
   # (e.g. `PHONE_ARM_WHIP_INPUT_ARGS="-f lavfi -i testsrc2=size=640x480:rate=30"`).
   if [ -n "${PHONE_ARM_WHIP_INPUT_ARGS:-}" ]; then

@@ -8,7 +8,8 @@ controller or follower machine when they use an existing hosted relay.
 - `forwarder.py` is an optional regional edge that forwards controller traffic
   to the main relay.
 - `api.py` creates anonymous robot sessions and exchanges a single invitation
-  capability for scoped control, media and TURN credentials.
+  capability for scoped control, media and TURN credentials. Video credentials
+  are omitted when the follower starts with no camera.
 - `capabilities.py` signs and verifies temporary credentials bound to one role
   and one robot session.
 - `run.sh` starts the main relay and reads TLS and token configuration from

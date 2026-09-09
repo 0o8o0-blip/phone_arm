@@ -31,7 +31,7 @@ const followFillEl = $('follow-fill');
 const logEl = $('log');
 
 // Keep this short because it is also stamped onto control datagrams.
-const APP_SCHEMA_ID = '20260908a';
+const APP_SCHEMA_ID = '20260908b';
 const APP_BOOT_MS = Date.now();
 const APP_SCRIPT_SRC = document.currentScript ? document.currentScript.src : '';
 const APP_PAGE_ID = (() => {
@@ -298,6 +298,15 @@ const video = {
           if (!r.ok) throw new Error(`config ${r.status}`);
           return r.json();
         });
+      if (cfg.videoAvailable === false) {
+        video.shouldReconnect = false;
+        video.state = 'unavailable';
+        video.lastError = '';
+        video.closePeer();
+        log('robot video unavailable (disabled at follower startup)');
+        updateViewerStatus();
+        return;
+      }
       if (!cfg.mediamtxWhepUrl || !cfg.mediamtxPlayToken) {
         throw new Error('config missing WHEP video endpoint');
       }

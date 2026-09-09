@@ -219,22 +219,33 @@ class SessionApi:
         follower_id = str(body.get("follower_id") or "robot")[:120]
         display_name = str(body.get("name") or follower_id)[:80]
         listed = bool(body.get("listed", False))
+        video_available = bool(body.get("video_available", True))
         edge = self._edge(body.get("edge"))
         registration_token = self._capability("register", session, expires_at)
         arm_token = self._capability("arm", session, expires_at)
-        publish_token = self._capability("media-publish", session, expires_at)
+        publish_token = (
+            self._capability("media-publish", session, expires_at)
+            if video_available
+            else ""
+        )
         access_token = self._mint_access(session=session, expires_at=access_expires_at)
         self.followers[session] = {
             "session": session,
             "follower_id": follower_id,
             "name": display_name,
             "listed": listed,
+            "video_available": video_available,
             "seen_at": now,
             "expires_at": expires_at,
         }
         self._event(
             "follower_created",
-            {"session": session, "follower_id": follower_id, "listed": listed},
+            {
+                "session": session,
+                "follower_id": follower_id,
+                "listed": listed,
+                "video_available": video_available,
+            },
         )
         return web.json_response(
             {
@@ -244,7 +255,12 @@ class SessionApi:
                 "edge": edge,
                 "relay_url": self.relay_urls[edge],
                 "arm_relay_token": arm_token,
-                "mediamtx_whip_url": f"{self.public_url}/media/{session}/whip",
+                "video_available": video_available,
+                "mediamtx_whip_url": (
+                    f"{self.public_url}/media/{session}/whip"
+                    if video_available
+                    else ""
+                ),
                 "mediamtx_publish_token": publish_token,
                 "share_url": f"{self.public_url}/robot/{session}#access={access_token}",
                 "access_expires_at": access_expires_at,
@@ -279,11 +295,15 @@ class SessionApi:
                 "follower_id": str(body.get("follower_id") or "robot")[:120],
                 "name": str(body.get("name") or body.get("follower_id") or "robot")[:80],
                 "listed": bool(body.get("listed", False)),
+                "video_available": bool(body.get("video_available", True)),
                 "expires_at": expiry,
             }
             self.followers[session] = follower
             self._event("follower_restored", {"session": session})
         follower["seen_at"] = now
+        follower["video_available"] = bool(
+            body.get("video_available", follower.get("video_available", True))
+        )
         return web.json_response(
             {"ok": True, "session": session, "lease_s": self.follower_timeout_s},
             headers={"Cache-Control": "no-store"},
@@ -310,16 +330,26 @@ class SessionApi:
         session = follower["session"]
         edge = self._edge(request.query.get("edge"))
         capability_expiry = min(float(token["expires_at"]), time.time() + 3600)
+        video_available = bool(follower.get("video_available", True))
         response: dict[str, Any] = {
-            "iceServers": [
-                self._turn_credentials(session, edge, capability_expiry)
-            ],
+            "videoAvailable": video_available,
+            "iceServers": (
+                [self._turn_credentials(session, edge, capability_expiry)]
+                if video_available
+                else []
+            ),
             "iceTransportPolicy": "relay",
             "controlRole": "viewer",
             "controlTransport": "viewer",
-            "mediamtxWhepUrl": f"{self.public_url}/media/{session}/whep",
-            "mediamtxPlayToken": self._capability(
-                "media-view", session, capability_expiry
+            "mediamtxWhepUrl": (
+                f"{self.public_url}/media/{session}/whep"
+                if video_available
+                else ""
+            ),
+            "mediamtxPlayToken": (
+                self._capability("media-view", session, capability_expiry)
+                if video_available
+                else ""
             ),
         }
         wants_control = str(request.query.get("want_control") or "").lower() in {
@@ -443,7 +473,11 @@ class SessionApi:
     async def robots(self, _request: web.Request) -> web.Response:
         now = time.time()
         robots = [
-            {"session": item["session"], "name": item["name"]}
+            {
+                "session": item["session"],
+                "name": item["name"],
+                "videoAvailable": bool(item.get("video_available", True)),
+            }
             for item in self.followers.values()
             if item.get("listed") and self._active(item, now)
         ]
