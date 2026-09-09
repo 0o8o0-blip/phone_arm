@@ -3034,6 +3034,7 @@ class BrowserPhone:
               f"turn={TURN_URL} control=relay-webtransport")
         app.router.add_get("/healthz", lambda _r: web.Response(text="ok"))
         app.router.add_get("/stats", self._serve_stats)
+        app.router.add_get("/sw.js", self._serve_service_worker)
         app.router.add_get("/static/app.js", self._serve_app_js)
         app.router.add_static("/static", STATIC_DIR, show_index=False)
         app.router.add_post("/test_event", self._test_event_handler)
@@ -3206,8 +3207,12 @@ class BrowserPhone:
 
     async def _webrtc_config(self, request: web.Request) -> web.Response:
         wants_control = self._truthy_query(request.query.get("want_control"))
+        wants_video = not (
+            request.query.get("want_video", "1").strip().lower()
+            in {"0", "false", "no", "off"}
+        )
         cfg = {
-            "iceServers": self._ice_servers_json(),
+            "iceServers": self._ice_servers_json() if wants_video else [],
             "iceTransportPolicy": "relay",
             "controlRole": "viewer",
             "controlTransport": "viewer",
@@ -3219,7 +3224,7 @@ class BrowserPhone:
                 cfg["controlTransport"] = "relay-webtransport"
                 cfg["sessionRelayWtUrl"] = _session_relay_wt_url("phone")
                 cfg["sessionRelaySession"] = SESSION_RELAY_SESSION
-        if MEDIAMTX_WHEP_URL and MEDIAMTX_PLAY_TOKEN:
+        if wants_video and MEDIAMTX_WHEP_URL and MEDIAMTX_PLAY_TOKEN:
             cfg["mediamtxWhepUrl"] = MEDIAMTX_WHEP_URL
             cfg["mediamtxPlayToken"] = MEDIAMTX_PLAY_TOKEN
         return web.json_response(cfg, headers={"Cache-Control": "no-store"})
@@ -3329,6 +3334,12 @@ class BrowserPhone:
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
             "Expires": "0",
+        })
+
+    async def _serve_service_worker(self, _request: web.Request) -> web.Response:
+        return web.FileResponse(STATIC_DIR / "sw.js", headers={
+            "Service-Worker-Allowed": "/",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
         })
 
     def _record_browser_debug_payload(self, data: dict) -> None:

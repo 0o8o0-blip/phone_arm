@@ -4,7 +4,8 @@
 //  1. Requests immersive-ar session with dom-overlay so our HTML controls
 //     are available during the AR session.
 //  2. Acquires a 'local' reference space so pose is relative to first frame.
-//  3. Opens WebTransport control and a separate robot-video PC.
+//  3. Opens the WebTransport control connection. Video is deliberately a
+//     separate viewer role, suitable for another browser or device.
 //  4. Each XR animation frame: read viewer pose, send a JSON message
 //     matching the lerobot phone schema (phone.pos/phone.rot/raw_inputs/enabled).
 
@@ -13,6 +14,9 @@ const landing = $('landing');
 const overlay = $('overlay');
 const piCam = $('pi-cam');
 const supportEl = $('xr-support');
+const invitePanel = $('invite-panel');
+const inviteUrlInput = $('invite-url');
+const openInviteBtn = $('open-invite-btn');
 const startBtn = $('start-btn');
 const leaderBtn = $('leader-btn');
 const leaderPanel = $('leader-panel');
@@ -31,7 +35,7 @@ const followFillEl = $('follow-fill');
 const logEl = $('log');
 
 // Keep this short because it is also stamped onto control datagrams.
-const APP_SCHEMA_ID = '20260908b';
+const APP_SCHEMA_ID = '20260910a';
 const APP_BOOT_MS = Date.now();
 const APP_SCRIPT_SRC = document.currentScript ? document.currentScript.src : '';
 const APP_PAGE_ID = (() => {
@@ -44,6 +48,8 @@ const APP_PAGE_ID = (() => {
 })();
 const URL_PARAMS = new URLSearchParams(location.search);
 const FORCE_VIEWER = URL_PARAMS.get('viewer') === '1' || URL_PARAMS.get('role') === 'viewer';
+const nativePoseBridge = window.PhoneArmNative || null;
+const nativePoseSupported = Boolean(nativePoseBridge?.isAvailable?.());
 let xrSupported = false;
 let clientRole = FORCE_VIEWER ? 'viewer' : 'unknown';
 let _controlClaimActive = false;
@@ -75,6 +81,28 @@ let pageAuthToken = '';
   }
 })();
 function authToken() { return pageAuthToken; }
+
+function openInvitation() {
+  const value = (inviteUrlInput.value || '').trim();
+  try {
+    const url = new URL(value);
+    const fragment = new URLSearchParams(url.hash.replace(/^#/, ''));
+    if (url.protocol !== 'https:' || !fragment.get('access')) {
+      throw new Error('missing HTTPS or #access');
+    }
+    location.href = url.href;
+  } catch (_) {
+    log('Use the complete HTTPS invitation link, including #access=…');
+    inviteUrlInput.focus();
+  }
+}
+
+openInviteBtn.addEventListener('click', openInvitation);
+inviteUrlInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') openInvitation();
+});
+if (!authToken()) invitePanel.classList.add('show');
+
 function apiFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
   if (authToken()) headers.set('Authorization', `Bearer ${authToken()}`);
@@ -782,7 +810,7 @@ async function startControl() {
   await edgeSelectionReady;
   // WebTransport is the only control transport we support. A control claimant
   // must be granted the controller role before the server returns the WT URL.
-  apiFetch(configUrl({ want_control: '1' }), { cache: 'no-store' })
+  apiFetch(configUrl({ want_control: '1', want_video: '0' }), { cache: 'no-store' })
     .then(r => {
       if (!r.ok) throw new Error(`config ${r.status}`);
       return r.json();
@@ -1175,21 +1203,26 @@ function log(msg) {
 
 // --- Feature detection ----------------------------------------------------
 async function checkXR() {
-  if (!('xr' in navigator)) {
-    supportEl.textContent = 'Viewer mode: robot video only.';
+  if (nativePoseSupported) {
+    supportEl.textContent = 'ARKit 6DoF: available. Video stays on the viewer device.';
     supportEl.className = 'ok';
+    return true;
+  }
+  if (!('xr' in navigator)) {
+    supportEl.textContent = '6DoF control unavailable. Open this link in the Phone Arm iOS app.';
+    supportEl.className = 'bad';
     return false;
   }
   try {
     const ok = await navigator.xr.isSessionSupported('immersive-ar');
     if (!ok) {
-      supportEl.textContent = 'Viewer mode: robot video only.';
-      supportEl.className = 'ok';
+      supportEl.textContent = '6DoF control unavailable. Open this link in the Phone Arm iOS app.';
+      supportEl.className = 'bad';
       return false;
     }
   } catch (e) {
-    supportEl.textContent = 'Viewer mode: robot video only.';
-    supportEl.className = 'ok';
+    supportEl.textContent = '6DoF control unavailable. Open this link in the Phone Arm iOS app.';
+    supportEl.className = 'bad';
     return false;
   }
   supportEl.textContent = FORCE_VIEWER
@@ -1866,6 +1899,106 @@ let xrRefSpace = null;
 let xrFpsWindow = { start: performance.now(), n: 0, fps: 0 };
 let noPoseSinceMs = 0;
 
+// The iOS shell is intentionally only a pose-source adapter. ARKit runs in
+// Swift, while session auth, safety controls, networking and the UI remain in
+// this shared web application.
+let nativeTrackingActive = false;
+let nativeTrackingState = 'idle';
+let nativeFpsWindow = { start: performance.now(), n: 0, fps: 0 };
+
+function nativePosePart(value, fallback) {
+  return Number.isFinite(Number(value)) ? Number(value) : fallback;
+}
+
+function onNativePose(sample) {
+  if (!nativeTrackingActive) return;
+  const position = sample.position || {};
+  const orientation = sample.orientation || {};
+  const poseValid = sample.tracking === true;
+  const p = {
+    x: nativePosePart(position.x, 0),
+    y: nativePosePart(position.y, 0),
+    z: nativePosePart(position.z, 0),
+  };
+  const q = {
+    x: nativePosePart(orientation.x, 0),
+    y: nativePosePart(orientation.y, 0),
+    z: nativePosePart(orientation.z, 0),
+    w: nativePosePart(orientation.w, 1),
+  };
+  recordPoseSourceFrame(poseValid);
+  sendPose(p, q, rawInputs(), b1Held, poseValid);
+
+  nativeFpsWindow.n++;
+  const now = performance.now();
+  if (now - nativeFpsWindow.start >= 500) {
+    nativeFpsWindow.fps = nativeFpsWindow.n * 1000 / (now - nativeFpsWindow.start);
+    nativeFpsWindow = { start: now, n: 0, fps: nativeFpsWindow.fps };
+  }
+  statusEl.textContent =
+    `arkit=${nativeTrackingState} fps=${nativeFpsWindow.fps.toFixed(0)}  ` +
+    `ctrl=${_controlTransport}:${controlReady() ? 'ok' : _controlState}  ` +
+    `rtt=${latencyAvgMs.toFixed(0)}ms\n` +
+    `b1=${b1Held ? 1 : 0}  grip=${gripperPos == null ? '--' : gripperPos.toFixed(2)}\n` +
+    `pos=(${p.x.toFixed(3)}, ${p.y.toFixed(3)}, ${p.z.toFixed(3)})\n` +
+    `rot=(${q.x.toFixed(2)}, ${q.y.toFixed(2)}, ${q.z.toFixed(2)}, ${q.w.toFixed(2)})`;
+  updateBanner(poseValid);
+}
+
+function onNativeState(state) {
+  nativeTrackingState = String(state.state || 'unknown');
+  if (state.message) log(`ARKit ${nativeTrackingState}: ${state.message}`);
+  if (nativeTrackingActive && nativeTrackingState !== 'running') {
+    setB1(false, `native_tracking_${nativeTrackingState}`);
+    updateBanner(false);
+  }
+}
+
+function startNativeTracking() {
+  if (!nativePoseSupported || nativeTrackingActive) return;
+  startBtn.disabled = true;
+  nativeTrackingActive = true;
+  nativeTrackingState = 'starting';
+  nativeFpsWindow = { start: performance.now(), n: 0, fps: 0 };
+  setClientRole('controller', 'arkit_start');
+  showLanding(false);
+  overlay.classList.add('active');
+  resetPoseSourceStats();
+  startPoseSourceStats();
+  startBrowserRuntimeProbes();
+  startThermalProbes();
+  startControl();
+  try {
+    nativePoseBridge.setPoseHandler(onNativePose);
+    nativePoseBridge.setStateHandler(onNativeState);
+    nativePoseBridge.start();
+    log('ARKit pose source requested');
+  } catch (e) {
+    log(`ARKit start failed: ${e.message || e}`);
+    stopNativeTracking('start_failed');
+  }
+}
+
+function stopNativeTracking(reason = 'native_stop') {
+  if (!nativeTrackingActive) return;
+  nativeTrackingActive = false;
+  setB1(false, reason);
+  try { nativePoseBridge.stop(); } catch (_) {}
+  nativePoseBridge.setPoseHandler(null);
+  nativePoseBridge.setStateHandler(null);
+  releaseControlClaim(reason);
+  stopPoseSourceStats(reason);
+  stopBrowserRuntimeProbes();
+  stopThermalProbes();
+  stopControl();
+  overlay.classList.remove('active', 'warn', 'bad');
+  showLanding(true);
+  setClientRole('unknown');
+  startBtn.disabled = false;
+  nativeTrackingState = 'idle';
+  log('ARKit pose source stopped');
+}
+
 async function startXR() {
   startBtn.disabled = true;
   try {
@@ -1927,7 +2060,6 @@ async function startXR() {
     startThermalProbes();
     overlay.classList.add('active');
     startControl();
-    startVideo();
 
     // We must provide a WebGL context to the XR session even if we don't
     // render anything ourselves. Create a hidden canvas.
@@ -1995,7 +2127,6 @@ async function startXR() {
     releaseControlClaim('xr_start_failed');
     setClientRole(FORCE_VIEWER ? 'viewer' : 'unknown');
     stopControl();
-    stopVideo();
     overlay.classList.remove('active');
     showLanding(true);
     startBtn.disabled = false;
@@ -2111,10 +2242,8 @@ function onXRFrame(t, frame) {
   if (pose) {
     const p = pose.transform.position;
     const q = pose.transform.orientation;
-    const lagStr = videoStatusText();
     statusEl.textContent =
       `fps=${xrFpsWindow.fps.toFixed(0)}  ctrl=${_controlTransport}:${controlReady() ? 'ok' : _controlState}  ctrl_rtt=${latencyAvgMs.toFixed(0)}ms\n` +
-      `${lagStr} ice=${iceTransportPolicy}\n` +
       `b1=${b1Held ? 1 : 0}  grip=${gripperPos == null ? '--' : gripperPos.toFixed(2)}\n` +
       `pos=(${p.x.toFixed(3)}, ${p.y.toFixed(3)}, ${p.z.toFixed(3)})\n` +
       `rot=(${q.x.toFixed(2)}, ${q.y.toFixed(2)}, ${q.z.toFixed(2)}, ${q.w.toFixed(2)})`;
@@ -2122,8 +2251,7 @@ function onXRFrame(t, frame) {
     const noPoseForMs = noPoseSinceMs ? Date.now() - noPoseSinceMs : 0;
     statusEl.textContent =
       `fps=${xrFpsWindow.fps.toFixed(0)}  ctrl=${_controlTransport}:${controlReady() ? 'ok' : _controlState}  rtt=${latencyAvgMs.toFixed(0)}ms  ` +
-      (noPoseForMs > 2000 ? 'move phone for AR lock' : '(no pose yet)') + '\n' +
-      `${videoStatusText()} ice=${iceTransportPolicy}`;
+      (noPoseForMs > 2000 ? 'move phone for AR lock' : '(no pose yet)');
   }
   updateBanner(!!pose);
 }
@@ -2176,7 +2304,6 @@ function onXREnd() {
   stopBrowserRuntimeProbes();
   stopThermalProbes();
   stopControl();
-  stopVideo();
   overlay.classList.remove('active');
   showLanding(true);
   setClientRole(FORCE_VIEWER ? 'viewer' : 'unknown');
@@ -2187,7 +2314,8 @@ function onXREnd() {
 
 stopBtn.addEventListener('click', (ev) => {
   log(`Stop btn clicked  trusted=${ev.isTrusted} x=${ev.clientX} y=${ev.clientY}`);
-  if (xrSession) xrSession.end();
+  if (nativeTrackingActive) stopNativeTracking('stop_button');
+  else if (xrSession) xrSession.end();
   else stopViewer();
 });
 // Also catch pointerdown so we know if a finger landed on Stop even if click
@@ -2198,6 +2326,10 @@ stopBtn.addEventListener('pointerdown', (ev) => {
 
 // --- Boot -----------------------------------------------------------------
 function startFromButton() {
+  if (nativePoseSupported && !FORCE_VIEWER) {
+    startNativeTracking();
+    return;
+  }
   if (FORCE_VIEWER || !xrSupported) {
     startBtn.disabled = true;
     startViewer(FORCE_VIEWER ? 'forced_viewer' : 'no_ar');
@@ -2258,22 +2390,28 @@ function autoStartViewer(reason) {
 
 checkXR().then((ok) => {
   xrSupported = ok;
-  startBtn.disabled = false;
+  startBtn.disabled = !authToken();
+  leaderBtn.disabled = !authToken();
   startBtn.textContent = (FORCE_VIEWER || !ok) ? 'Watch Video' : 'Control with phone';
   startBtn.addEventListener('click', startFromButton);
-  if (FORCE_VIEWER) {
+  if (FORCE_VIEWER && authToken()) {
     autoStartViewer('forced_viewer');
   }
 }).catch(() => {
   xrSupported = false;
   supportEl.textContent = 'Viewer mode: robot video only.';
   supportEl.className = 'ok';
-  startBtn.disabled = false;
+  startBtn.disabled = !authToken();
+  leaderBtn.disabled = !authToken();
   startBtn.textContent = 'Watch Video';
   startBtn.addEventListener('click', startFromButton);
-  if (FORCE_VIEWER) autoStartViewer('forced_viewer');
+  if (FORCE_VIEWER && authToken()) autoStartViewer('forced_viewer');
 });
 log('page loaded');
+
+if ('serviceWorker' in navigator && !nativePoseSupported) {
+  navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
+}
 
 // --- Test-only B1 cycler (URL-gated, no-op in production) -----------------
 // ?autoB1=on_ms,off_ms[,start_delay_ms]  -> press B1 for on_ms then release for

@@ -1,5 +1,15 @@
 # Phone controller
 
-Static browser application for WebXR phone control and WHEP video playback.
-The follower gateway serves these files locally and synchronizes them to the
+Shared web application for phone control and independent WHEP video viewing.
+Android browsers supply 6DoF through WebXR. The thin app in `ios/` supplies
+ARKit poses through `native-bridge.js`; session handling, controls, safety and
+networking stay in this web application.
+
+Controller mode deliberately does not open a video connection. Add
+`?viewer=1` to the robot URL to use a separate browser or device as the video
+viewer. The root page accepts a complete invitation URL, which also makes an
+installed Home Screen web app usable without embedding a session secret in its
+manifest.
+
+The follower gateway serves these files locally and they are copied to the
 hosted web endpoint in the current deployment.

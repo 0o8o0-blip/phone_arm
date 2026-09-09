@@ -331,11 +331,14 @@ class SessionApi:
         edge = self._edge(request.query.get("edge"))
         capability_expiry = min(float(token["expires_at"]), time.time() + 3600)
         video_available = bool(follower.get("video_available", True))
+        wants_video = str(request.query.get("want_video") or "1").lower() not in {
+            "0", "false", "no", "off"
+        }
         response: dict[str, Any] = {
             "videoAvailable": video_available,
             "iceServers": (
                 [self._turn_credentials(session, edge, capability_expiry)]
-                if video_available
+                if video_available and wants_video
                 else []
             ),
             "iceTransportPolicy": "relay",
@@ -343,12 +346,12 @@ class SessionApi:
             "controlTransport": "viewer",
             "mediamtxWhepUrl": (
                 f"{self.public_url}/media/{session}/whep"
-                if video_available
+                if video_available and wants_video
                 else ""
             ),
             "mediamtxPlayToken": (
                 self._capability("media-view", session, capability_expiry)
-                if video_available
+                if video_available and wants_video
                 else ""
             ),
         }

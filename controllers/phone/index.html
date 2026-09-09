@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#000">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/static/manifest.webmanifest">
 <title>Phone Arm — Controller</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
@@ -14,6 +17,10 @@
   #landing h1 { font-size: 22px; }
   #landing p { font-size: 14px; line-height: 1.4; color: #aaa; }
   #landing pre { font-size: 12px; background: #111; padding: 8px; border-radius: 6px; overflow-x: auto; color: #6cf; }
+  #invite-panel { display: none; padding: 14px; gap: 10px; background: #111; border: 1px solid #345; border-radius: 10px; }
+  #invite-panel.show { display: grid; }
+  #invite-url { width: 100%; padding: 12px; color: #eee; background: #181818; border: 1px solid #555; border-radius: 8px; user-select: text; -webkit-user-select: text; }
+  #open-invite-btn { padding: 12px; border: 0; border-radius: 8px; background: #2c8; color: #00150e; font-weight: 700; }
   #mode-actions { margin-top: auto; display: grid; gap: 12px; }
   #start-btn, #leader-btn { padding: 20px; border: none; border-radius: 12px; font-size: 19px; font-weight: 600; }
   #start-btn { background: #2c8; color: #000; }
@@ -167,6 +174,11 @@
 <div id="landing">
   <h1>Control this arm</h1>
   <div id="xr-support">Checking WebXR support…</div>
+  <div id="invite-panel">
+    <p>Paste the complete invitation link printed by the follower.</p>
+    <input id="invite-url" type="url" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="https://…/robot/r_…#access=…">
+    <button id="open-invite-btn">Open invitation</button>
+  </div>
   <p>Choose one controller. Starting a leader arm replaces phone control for this one-to-one session.</p>
   <div id="leader-panel">
     <p>Run this on the computer with your leader arm. It will list the connected arms and ask which one to use.</p>
@@ -196,6 +208,7 @@
   <div id="banner"></div>
 </div>
 
-<script src="/static/app.js?v=20260907a"></script>
+<script src="/static/native-bridge.js?v=20260910a"></script>
+<script src="/static/app.js?v=20260910a"></script>
 </body>
 </html>

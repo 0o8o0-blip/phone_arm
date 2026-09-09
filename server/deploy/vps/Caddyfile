@@ -8,6 +8,15 @@
 		file_server
 	}
 
+	# Root-scoped, network-only service worker for the installable web app.
+	handle /sw.js {
+		header Service-Worker-Allowed "/"
+		header Cache-Control "no-cache, no-store, must-revalidate"
+		rewrite * /static/sw.js
+		root * /opt/phone_arm
+		file_server
+	}
+
 	# Root path -> operator index page. Matched via named matcher so it's
 	# EXACT, not the prefix "/" (which would swallow everything).
 	@controller_page path / /robot/*
