@@ -1,0 +1,10 @@
+[Interface]
+Address = 10.44.0.2/30
+ListenPort = 51820
+PrivateKey = ASIA_PRIVATE_KEY_GOES_HERE
+
+[Peer]
+PublicKey = LONDON_PUBLIC_KEY_GOES_HERE
+AllowedIPs = 10.44.0.1/32
+Endpoint = 188.166.154.201:51820
+PersistentKeepalive = 25

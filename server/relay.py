@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""WebTransport relay carrying control datagrams between controller and arm."""
+"""Regional WebTransport relay carrying control between controller and arm.
+
+Devices terminate QUIC at their nearest edge. Same-edge peers pair locally;
+controller traffic for a remote arm crosses a latest-only UDP path inside
+WireGuard to the arm's relay.
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,6 +12,9 @@ import asyncio
 import json
 import logging
 import os
+import re
+import socket
+import struct
 import time
 import urllib.parse
 import uuid
@@ -38,7 +46,6 @@ except ImportError as e:  # pragma: no cover - exercised on hosts without aioqui
         "aioquic is required for the WebTransport relay. "
         "Install python3-aioquic or pip install aioquic."
     ) from e
-
 
 def _now_ms() -> float:
     return time.time() * 1000.0
@@ -74,6 +81,7 @@ TIMING_TRIM_FIELDS = (
     "_relay_arm_connected",
     "_relay_session",
 )
+EDGE_NAME_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 
 
 def _trim_for_datagram_limit(msg: dict[str, Any], max_bytes: int) -> bool:
@@ -89,10 +97,9 @@ def _trim_for_datagram_limit(msg: dict[str, Any], max_bytes: int) -> bool:
 def _ensure_edge_timing(msg: dict[str, Any], relay_recv_ms: float) -> None:
     """Guarantee edge attribution fields exist for phone pose datagrams.
 
-    A Singapore forwarder stamps these fields before sending upstream. If the
-    phone connects directly to this relay, synthesize a zero-distance edge at
-    the relay so downstream logs can distinguish direct mode from missing
-    telemetry.
+    Older regional forwarders stamped these fields before sending upstream.
+    Full regional relays synthesize a zero-distance edge measurement so
+    downstream logs can distinguish local relay ingress from missing telemetry.
     """
     edge_recv_ms = _float_or_none(msg.get("_edge_recv_ms"))
     edge_send_ms = _float_or_none(msg.get("_edge_send_ms"))
@@ -143,6 +150,9 @@ class ProbeStats:
 
 STATS = ProbeStats()
 EVENT_LOG_PATH = ""
+EDGE_NAME = "europe"
+BACKBONE: "BackboneProtocol | None" = None
+PEER_BACKBONES: dict[str, tuple[str, int]] = {}
 
 
 class LatestSlot:
@@ -255,11 +265,19 @@ class ControlRelay:
         self.max_datagram_bytes = max_datagram_bytes
         self.sessions: dict[str, ControlSession] = {}
 
-    def authorize(self, role: str, token: str, session: str) -> float | None:
+    def authorize(
+        self,
+        role: str,
+        token: str,
+        session: str,
+        *,
+        home_edge: str | None = None,
+    ) -> float | None:
+        capability_role = f"phone@{home_edge}" if role == "phone" and home_edge else role
         if not verify_capability(
             self.capability_secret,
             token,
-            role=role,
+            role=capability_role,
             session=session,
         ):
             return None
@@ -508,6 +526,318 @@ def record_event(event: str, details: dict[str, Any]) -> None:
         logging.warning("event log write failed: %s", e)
 
 
+BACKBONE_MAGIC = b"PAU1"
+BACKBONE_CONTROL = 1
+BACKBONE_FEEDBACK = 2
+BACKBONE_CLOSE = 3
+BACKBONE_HEADER = struct.Struct("!4sBQQQBBH")
+BACKBONE_MAX_PACKET_BYTES = 1400
+BACKBONE_MAX_FUTURE_MS = 100
+BACKBONE_SOCKET_BUFFER_BYTES = 16 * 1024
+
+
+@dataclass
+class BackbonePacket:
+    kind: int
+    epoch: int
+    sequence: int
+    sent_ms: int
+    source_edge: str
+    session: str
+    token: str
+    payload: bytes
+
+    def encode(self) -> bytes:
+        try:
+            edge = self.source_edge.encode("ascii")
+            session = self.session.encode("ascii")
+            token = self.token.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("backbone routing fields must be ASCII") from exc
+        if len(edge) > 255 or len(session) > 255 or len(token) > 65535:
+            raise ValueError("backbone routing field is too long")
+        return b"".join((
+            BACKBONE_HEADER.pack(
+                BACKBONE_MAGIC,
+                self.kind,
+                self.epoch,
+                self.sequence,
+                self.sent_ms,
+                len(edge),
+                len(session),
+                len(token),
+            ),
+            edge,
+            session,
+            token,
+            self.payload,
+        ))
+
+    @classmethod
+    def decode(cls, data: bytes) -> "BackbonePacket | None":
+        if len(data) < BACKBONE_HEADER.size:
+            return None
+        magic, kind, epoch, sequence, sent_ms, edge_len, session_len, token_len = (
+            BACKBONE_HEADER.unpack_from(data)
+        )
+        body_at = BACKBONE_HEADER.size
+        fields_end = body_at + edge_len + session_len + token_len
+        if magic != BACKBONE_MAGIC or fields_end > len(data):
+            return None
+        try:
+            source_edge = data[body_at:body_at + edge_len].decode("ascii")
+            session_at = body_at + edge_len
+            session = data[session_at:session_at + session_len].decode("ascii")
+            token_at = session_at + session_len
+            token = data[token_at:token_at + token_len].decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        return cls(
+            kind=kind,
+            epoch=epoch,
+            sequence=sequence,
+            sent_ms=sent_ms,
+            source_edge=source_edge,
+            session=session,
+            token=token,
+            payload=data[fields_end:],
+        )
+
+
+@dataclass
+class RemotePhone:
+    peer: ControlPeer
+    epoch: int
+    token: str
+    expires_at_s: float
+    last_sequence: int = -1
+    feedback_sequence: int = 0
+    last_seen_ms: float = field(default_factory=_now_ms)
+
+
+class BackboneProtocol(asyncio.DatagramProtocol):
+    """Latest-only UDP session router intended to run inside WireGuard."""
+
+    REMOTE_PEER_TIMEOUT_MS = 15_000
+
+    def __init__(self, *, max_age_ms: float) -> None:
+        self.max_age_ms = max_age_ms
+        self.transport: asyncio.DatagramTransport | None = None
+        self.ingress_handlers: dict[tuple[str, str], "WebTransportHandler"] = {}
+        self.remote_phones: dict[tuple[str, str], RemotePhone] = {}
+        self.closed_epochs: dict[tuple[str, str], tuple[int, float]] = {}
+        self.pending: dict[
+            tuple[int, str, str], tuple[BackbonePacket, tuple[str, int]]
+        ] = {}
+        self._flush_scheduled = False
+        self.drop_counts: dict[str, int] = {}
+
+    def connection_made(self, transport) -> None:
+        self.transport = transport
+        sock = transport.get_extra_info("socket")
+        if sock is not None:
+            # A small kernel queue is intentional: under overload, discard
+            # commands instead of accumulating latency behind obsolete state.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BACKBONE_SOCKET_BUFFER_BYTES)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BACKBONE_SOCKET_BUFFER_BYTES)
+
+    def _drop(self, reason: str) -> None:
+        self.drop_counts[reason] = self.drop_counts.get(reason, 0) + 1
+
+    def _trusted_source(self, packet: BackbonePacket, addr: tuple[str, int]) -> bool:
+        expected = PEER_BACKBONES.get(packet.source_edge)
+        return expected is not None and addr[0] == expected[0] and addr[1] == expected[1]
+
+    def register_ingress(
+        self, home_edge: str, session: str, handler: "WebTransportHandler"
+    ) -> None:
+        self.ingress_handlers[(home_edge, session)] = handler
+
+    def unregister_ingress(
+        self, home_edge: str, session: str, handler: "WebTransportHandler"
+    ) -> None:
+        key = (home_edge, session)
+        if self.ingress_handlers.get(key) is handler:
+            self.ingress_handlers.pop(key, None)
+
+    def send_control(self, home_edge: str, packet: BackbonePacket) -> None:
+        self._queue_latest(home_edge, packet)
+
+    def _queue_latest(self, destination_edge: str, packet: BackbonePacket) -> None:
+        destination = PEER_BACKBONES.get(destination_edge)
+        if destination is None:
+            self._drop("unknown_destination")
+            return
+        self.pending[(packet.kind, destination_edge, packet.session)] = (
+            packet,
+            destination,
+        )
+        if not self._flush_scheduled:
+            self._flush_scheduled = True
+            asyncio.get_running_loop().call_soon(self._flush_latest)
+
+    def _flush_latest(self) -> None:
+        self._flush_scheduled = False
+        pending, self.pending = self.pending, {}
+        if self.transport is None:
+            self._drop("transport_unavailable")
+            return
+        for packet, destination in pending.values():
+            try:
+                encoded = packet.encode()
+            except ValueError:
+                self._drop("encode")
+                continue
+            if len(encoded) > BACKBONE_MAX_PACKET_BYTES:
+                self._drop("oversize")
+                continue
+            self.transport.sendto(encoded, destination)
+
+    def send_close(self, home_edge: str, packet: BackbonePacket) -> None:
+        pending_key = (BACKBONE_CONTROL, home_edge, packet.session)
+        pending = self.pending.get(pending_key)
+        if pending is not None and pending[0].epoch == packet.epoch:
+            self.pending.pop(pending_key, None)
+        destination = PEER_BACKBONES.get(home_edge)
+        if self.transport is not None and destination is not None:
+            encoded = packet.encode()
+            if len(encoded) <= BACKBONE_MAX_PACKET_BYTES:
+                self.transport.sendto(encoded, destination)
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        if len(data) > BACKBONE_MAX_PACKET_BYTES:
+            self._drop("oversize")
+            return
+        packet = BackbonePacket.decode(data)
+        if packet is None or not self._trusted_source(packet, addr):
+            self._drop("untrusted_or_malformed")
+            return
+        age_ms = _now_ms() - packet.sent_ms
+        if age_ms > self.max_age_ms:
+            self._drop("expired")
+            return
+        if age_ms < -BACKBONE_MAX_FUTURE_MS:
+            self._drop("clock_skew")
+            return
+        if packet.kind == BACKBONE_CONTROL:
+            self._receive_control(packet)
+        elif packet.kind == BACKBONE_FEEDBACK:
+            self._receive_feedback(packet)
+        elif packet.kind == BACKBONE_CLOSE:
+            self._receive_close(packet)
+        else:
+            self._drop("unknown_kind")
+
+    def _receive_control(self, packet: BackbonePacket) -> None:
+        if CONTROL_RELAY is None or packet.session == "":
+            return
+        key = (packet.source_edge, packet.session)
+        closed = self.closed_epochs.get(key)
+        if closed is not None and packet.epoch <= closed[0]:
+            self._drop("closed_epoch")
+            return
+        remote = self.remote_phones.get(key)
+        if remote is not None and packet.epoch < remote.epoch:
+            self._drop("old_epoch")
+            return
+        if remote is None or packet.epoch > remote.epoch:
+            expires_at_s = CONTROL_RELAY.authorize(
+                "phone",
+                packet.token,
+                packet.session,
+                home_edge=EDGE_NAME,
+            )
+            if expires_at_s is None:
+                self._drop("unauthorized")
+                return
+            if remote is not None:
+                session = CONTROL_RELAY.sessions.get(packet.session)
+                if session is not None:
+                    CONTROL_RELAY.detach_peer(session, remote.peer, "new backbone epoch")
+            peer = ControlPeer(
+                role="phone",
+                peer_id=f"backbone:{packet.source_edge}:{packet.epoch}",
+                stream_id=-1,
+                addr=PEER_BACKBONES.get(packet.source_edge),
+                send_datagram=lambda payload, k=key: self._send_feedback(k, payload),
+            )
+            remote = RemotePhone(peer, packet.epoch, packet.token, expires_at_s)
+            self.remote_phones[key] = remote
+            session = CONTROL_RELAY.get_session(packet.session, expires_at_s)
+            # Register before attach_peer sends its welcome through the
+            # virtual peer's feedback callback.
+            CONTROL_RELAY.attach_peer(session, peer)
+        if packet.sequence <= remote.last_sequence:
+            self._drop("old_sequence")
+            return
+        remote.last_sequence = packet.sequence
+        remote.last_seen_ms = _now_ms()
+        session = CONTROL_RELAY.sessions.get(packet.session)
+        if session is not None:
+            CONTROL_RELAY.handle_datagram(session, remote.peer, packet.payload)
+
+    def _send_feedback(self, key: tuple[str, str], payload: bytes) -> None:
+        remote = self.remote_phones.get(key)
+        if remote is None or key[0] not in PEER_BACKBONES:
+            return
+        remote.feedback_sequence += 1
+        packet = BackbonePacket(
+            BACKBONE_FEEDBACK,
+            remote.epoch,
+            remote.feedback_sequence,
+            int(_now_ms()),
+            EDGE_NAME,
+            key[1],
+            "",
+            payload,
+        )
+        self._queue_latest(key[0], packet)
+
+    def _receive_feedback(self, packet: BackbonePacket) -> None:
+        handler = self.ingress_handlers.get((packet.source_edge, packet.session))
+        if handler is None or handler.backbone_epoch != packet.epoch:
+            self._drop("unknown_ingress")
+            return
+        if packet.sequence <= handler.backbone_feedback_sequence:
+            self._drop("old_feedback_sequence")
+            return
+        handler.backbone_feedback_sequence = packet.sequence
+        handler.send_datagram(packet.payload)
+
+    def _receive_close(self, packet: BackbonePacket) -> None:
+        key = (packet.source_edge, packet.session)
+        if not CONTROL_RELAY or not CONTROL_RELAY.authorize(
+            "phone", packet.token, packet.session, home_edge=EDGE_NAME
+        ):
+            return
+        prior = self.closed_epochs.get(key)
+        if prior is None or packet.epoch > prior[0]:
+            self.closed_epochs[key] = (packet.epoch, _now_ms())
+        remote = self.remote_phones.get(key)
+        if remote is not None and remote.epoch == packet.epoch:
+            self._detach_remote(key, remote, "backbone ingress closed")
+
+    def _detach_remote(self, key: tuple[str, str], remote: RemotePhone, reason: str) -> None:
+        session = CONTROL_RELAY.sessions.get(key[1]) if CONTROL_RELAY is not None else None
+        if session is not None:
+            CONTROL_RELAY.detach_peer(session, remote.peer, reason)
+        self.remote_phones.pop(key, None)
+
+    def prune_remote_peers(self, now_ms: float | None = None) -> None:
+        current = _now_ms() if now_ms is None else now_ms
+        for key, remote in list(self.remote_phones.items()):
+            if (
+                current - remote.last_seen_ms > self.REMOTE_PEER_TIMEOUT_MS
+                or remote.expires_at_s * 1000 <= current
+            ):
+                self._detach_remote(key, remote, "backbone peer timeout")
+        self.closed_epochs = {
+            key: value
+            for key, value in self.closed_epochs.items()
+            if current - value[1] <= self.REMOTE_PEER_TIMEOUT_MS
+        }
+
+
 class WebTransportHandler:
     def __init__(
         self,
@@ -525,15 +855,30 @@ class WebTransportHandler:
         self.query = query
         self.client = client
         self.transmit = transmit
+        self.max_datagram_bytes = (
+            CONTROL_RELAY.max_datagram_bytes if CONTROL_RELAY is not None else 1024
+        )
         self.accepted = False
         self.closed = False
         self.session: ControlSession | None = None
         self.peer: ControlPeer | None = None
+        self.backbone_home: str | None = None
+        self.backbone_token = ""
+        self.backbone_epoch = time.time_ns()
+        self.backbone_sequence = 0
+        self.backbone_feedback_sequence = -1
+        self.backbone_keepalive_task: asyncio.Task | None = None
         self.stats_key = f"{id(connection)}:{stream_id}"
         self.rx = 0
         self.tx = 0
 
-    def accept(self, *, expires_at_s: float) -> None:
+    def accept(
+        self,
+        *,
+        expires_at_s: float,
+        backbone_home: str | None = None,
+        backbone_token: str = "",
+    ) -> None:
         self.accepted = True
         STATS.accepted += 1
         STATS.sessions[self.stats_key] = self
@@ -547,7 +892,16 @@ class WebTransportHandler:
         )
         self.transmit()
         record_event("wt_accept", {"stream_id": self.stream_id, "path": self.path, "client": self.client})
-        self._activate_control(expires_at_s)
+        if backbone_home is None:
+            self._activate_control(expires_at_s)
+        else:
+            self.backbone_home = backbone_home
+            self.backbone_token = backbone_token
+            assert BACKBONE is not None
+            BACKBONE.register_ingress(backbone_home, self._session_name(), self)
+            self.backbone_keepalive_task = asyncio.create_task(
+                self._backbone_keepalive_loop()
+            )
 
     def reject(self, status: int = 404) -> None:
         self.closed = True
@@ -562,9 +916,27 @@ class WebTransportHandler:
         if self.closed:
             return
         self.closed = True
+        if self.backbone_keepalive_task is not None:
+            self.backbone_keepalive_task.cancel()
         STATS.closed += 1
         STATS.sessions.pop(self.stats_key, None)
-        if CONTROL_RELAY is not None and self.session is not None and self.peer is not None:
+        if self.backbone_home is not None and BACKBONE is not None:
+            session_name = self._session_name()
+            BACKBONE.unregister_ingress(self.backbone_home, session_name, self)
+            BACKBONE.send_close(
+                self.backbone_home,
+                BackbonePacket(
+                    BACKBONE_CLOSE,
+                    self.backbone_epoch,
+                    self.backbone_sequence + 1,
+                    int(_now_ms()),
+                    EDGE_NAME,
+                    session_name,
+                    self.backbone_token,
+                    b"",
+                ),
+            )
+        elif CONTROL_RELAY is not None and self.session is not None and self.peer is not None:
             CONTROL_RELAY.detach_peer(self.session, self.peer, reason)
         record_event("wt_close", {
             "stream_id": self.stream_id,
@@ -590,6 +962,9 @@ class WebTransportHandler:
         self.peer = peer
         CONTROL_RELAY.attach_peer(self.session, peer)
 
+    def _session_name(self) -> str:
+        return (self.query.get("session") or ["default"])[0] or "default"
+
     def _send_datagram(self, data: bytes) -> None:
         self.connection.send_datagram(stream_id=self.stream_id, data=data)
         self.tx += 1
@@ -597,12 +972,76 @@ class WebTransportHandler:
         STATS.bytes_tx += len(data)
         self.transmit()
 
+    def send_datagram(self, data: bytes) -> None:
+        if not self.closed:
+            self._send_datagram(data)
+
+    def send_json_datagram(self, message: dict[str, Any]) -> None:
+        self.send_datagram(_json_dumps(message).encode("utf-8"))
+
+    async def _backbone_keepalive_loop(self) -> None:
+        try:
+            while not self.closed:
+                await asyncio.sleep(ControlRelay.KEEPALIVE_S)
+                if self.closed:
+                    return
+                # This proves only the short controller-to-ingress connection.
+                # End-to-end arm health is tracked separately by robot ACKs.
+                self.send_json_datagram({
+                    "type": "relay_keepalive",
+                    "edge": EDGE_NAME,
+                    "t_relay_ms": round(_now_ms(), 3),
+                })
+        except asyncio.CancelledError:
+            return
+
     def handle_datagram(self, data: bytes) -> None:
         self.rx += 1
         STATS.datagrams_rx += 1
         STATS.bytes_rx += len(data)
         STATS.last_rx_ms = _now_ms()
-        if CONTROL_RELAY is not None and self.session is not None and self.peer is not None:
+        if self.backbone_home is not None and BACKBONE is not None:
+            received_ms = _now_ms()
+            try:
+                message = json.loads(data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                message = None
+            if isinstance(message, dict) and message.get("t") is not None:
+                self.send_json_datagram({
+                    "type": "edge_ack",
+                    "ack_t": message.get("t"),
+                    "ack_seq": message.get("seq"),
+                    "t_edge_recv_ms": round(received_ms, 3),
+                    "t_edge_send_ms": round(_now_ms(), 3),
+                    "edge": EDGE_NAME,
+                })
+                stamped = dict(message)
+                stamped["_edge_recv_ms"] = round(received_ms, 3)
+                stamped["_edge_send_ms"] = round(_now_ms(), 3)
+                stamped["_edge_q_ms"] = max(
+                    0.0, stamped["_edge_send_ms"] - stamped["_edge_recv_ms"]
+                )
+                try:
+                    candidate = _json_dumps(stamped).encode("utf-8")
+                except (TypeError, ValueError):
+                    candidate = b""
+                if candidate and len(candidate) <= self.max_datagram_bytes:
+                    data = candidate
+            self.backbone_sequence += 1
+            BACKBONE.send_control(
+                self.backbone_home,
+                BackbonePacket(
+                    BACKBONE_CONTROL,
+                    self.backbone_epoch,
+                    self.backbone_sequence,
+                    int(received_ms),
+                    EDGE_NAME,
+                    self._session_name(),
+                    self.backbone_token,
+                    data,
+                ),
+            )
+        elif CONTROL_RELAY is not None and self.session is not None and self.peer is not None:
             CONTROL_RELAY.handle_datagram(self.session, self.peer, data)
 
 
@@ -659,7 +1098,13 @@ class HttpServerProtocol(QuicConnectionProtocol):
                     role = path.rsplit("/", 1)[-1]
                     token = (query.get("token") or [""])[0]
                     session = (query.get("session") or ["default"])[0]
-                    expires_at_s = CONTROL_RELAY.authorize(role, token, session)
+                    home_edge = (query.get("home") or [EDGE_NAME])[0] or EDGE_NAME
+                    expires_at_s = CONTROL_RELAY.authorize(
+                        role,
+                        token,
+                        session,
+                        home_edge=home_edge if role == "phone" else None,
+                    )
                     if expires_at_s is None:
                         record_event("wt_unauthorized", {
                             "role": role,
@@ -668,7 +1113,30 @@ class HttpServerProtocol(QuicConnectionProtocol):
                         })
                         handler.reject(401)
                         return
-                    handler.accept(expires_at_s=expires_at_s)
+                    if home_edge == EDGE_NAME:
+                        handler.accept(expires_at_s=expires_at_s)
+                        return
+                    # Arms connect to their own selected edge. Only controller
+                    # traffic crosses the backbone, toward the arm's edge.
+                    has_backbone = (
+                        role == "phone"
+                        and BACKBONE is not None
+                        and home_edge in PEER_BACKBONES
+                    )
+                    if not has_backbone:
+                        record_event("edge_route_rejected", {
+                            "edge": EDGE_NAME,
+                            "home": home_edge,
+                            "role": role,
+                            "session": session,
+                        })
+                        handler.reject(503)
+                        return
+                    handler.accept(
+                        expires_at_s=expires_at_s,
+                        backbone_home=home_edge,
+                        backbone_token=token,
+                    )
                 else:
                     handler.reject(404)
                 return
@@ -685,7 +1153,7 @@ class HttpServerProtocol(QuicConnectionProtocol):
                 event.stream_id,
                 200,
                 (
-                    "phone-arm WebTransport control relay\n"
+                    f"phone-arm WebTransport control relay ({EDGE_NAME})\n"
                     "control: /wt/phone?session=default&token=... and /wt/arm?session=default&token=...\n"
                 ),
             )
@@ -733,6 +1201,13 @@ async def _stats_loop(interval_s: float) -> None:
         if CONTROL_RELAY is not None:
             CONTROL_RELAY.prune_expired()
             details["control"] = CONTROL_RELAY.stats()
+        if BACKBONE is not None:
+            details["backbone"] = {
+                "transport": "udp",
+                "pending": len(BACKBONE.pending),
+                "remote_phones": len(BACKBONE.remote_phones),
+                "drops": dict(BACKBONE.drop_counts),
+            }
         record_event("stats", details)
 
 
@@ -741,6 +1216,8 @@ async def _expiry_loop() -> None:
         await asyncio.sleep(60)
         if CONTROL_RELAY is not None:
             CONTROL_RELAY.prune_expired()
+        if BACKBONE is not None:
+            BACKBONE.prune_remote_peers()
 
 
 async def main() -> None:
@@ -752,6 +1229,21 @@ async def main() -> None:
     parser.add_argument("--event-log", default="")
     parser.add_argument("--stats-interval-s", type=float, default=5.0)
     parser.add_argument(
+        "--edge-name",
+        default=os.environ.get("PHONE_ARM_EDGE_NAME", "europe"),
+        help="short name for this regional relay",
+    )
+    parser.add_argument("--backbone-host", default="127.0.0.1")
+    parser.add_argument("--backbone-port", type=int, default=7443)
+    parser.add_argument("--backbone-max-age-ms", type=float, default=150.0)
+    parser.add_argument(
+        "--peer-backbone",
+        action="append",
+        default=[],
+        metavar="NAME=HOST:PORT",
+        help="WireGuard peer UDP address; repeat for each reachable region",
+    )
+    parser.add_argument(
         "--capability-secret",
         default=os.environ.get("PHONE_ARM_CAPABILITY_SECRET", ""),
         required=not bool(os.environ.get("PHONE_ARM_CAPABILITY_SECRET", "")),
@@ -760,8 +1252,33 @@ async def main() -> None:
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    global CONTROL_RELAY, EVENT_LOG_PATH
+    global BACKBONE, CONTROL_RELAY, EDGE_NAME, EVENT_LOG_PATH, PEER_BACKBONES
     EVENT_LOG_PATH = args.event_log
+    EDGE_NAME = args.edge_name.strip().lower()
+    if not EDGE_NAME_RE.fullmatch(EDGE_NAME):
+        parser.error("--edge-name must contain only lowercase letters, digits, and hyphens")
+    peers: dict[str, tuple[str, int]] = {}
+    for value in args.peer_backbone:
+        try:
+            name, address = value.split("=", 1)
+            host, raw_port = address.rsplit(":", 1)
+            port = int(raw_port)
+        except ValueError:
+            parser.error("--peer-backbone must use NAME=HOST:PORT")
+        name = name.strip().lower()
+        if (
+            not EDGE_NAME_RE.fullmatch(name)
+            or name == EDGE_NAME
+            or not host
+            or not 1 <= port <= 65535
+        ):
+            parser.error(f"invalid --peer-backbone value: {value!r}")
+        try:
+            peer_ip = socket.gethostbyname(host.strip())
+        except OSError as exc:
+            parser.error(f"cannot resolve --peer-backbone host {host!r}: {exc}")
+        peers[name] = (peer_ip, port)
+    PEER_BACKBONES = peers
     capability_secret = _read_secret_arg(args.capability_secret)
     if not capability_secret:
         parser.error("--capability-secret must not be empty")
@@ -769,6 +1286,14 @@ async def main() -> None:
         capability_secret=capability_secret,
         max_datagram_bytes=max(1, args.max_datagram_bytes),
     )
+    backbone_transport = None
+    if PEER_BACKBONES:
+        loop = asyncio.get_running_loop()
+        backbone_transport, protocol = await loop.create_datagram_endpoint(
+            lambda: BackboneProtocol(max_age_ms=max(1.0, args.backbone_max_age_ms)),
+            local_addr=(args.backbone_host, args.backbone_port),
+        )
+        BACKBONE = protocol
 
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(message)s",
@@ -790,20 +1315,32 @@ async def main() -> None:
             "phone": True,
             "arm": True,
         },
+        "edge": EDGE_NAME,
+        "backbone": {
+            "host": args.backbone_host,
+            "port": args.backbone_port,
+            "max_age_ms": args.backbone_max_age_ms,
+            "peers": sorted(PEER_BACKBONES),
+            "transport": "wireguard-udp",
+        },
         "max_datagram_bytes": CONTROL_RELAY.max_datagram_bytes,
     })
     if args.stats_interval_s > 0:
         asyncio.create_task(_stats_loop(args.stats_interval_s))
     asyncio.create_task(_expiry_loop())
-    await serve(
-        args.host,
-        args.port,
-        configuration=configuration,
-        create_protocol=HttpServerProtocol,
-        session_ticket_fetcher=store.pop,
-        session_ticket_handler=store.add,
-    )
-    await asyncio.Future()
+    try:
+        await serve(
+            args.host,
+            args.port,
+            configuration=configuration,
+            create_protocol=HttpServerProtocol,
+            session_ticket_fetcher=store.pop,
+            session_ticket_handler=store.add,
+        )
+        await asyncio.Future()
+    finally:
+        if backbone_transport is not None:
+            backbone_transport.close()
 
 
 if __name__ == "__main__":

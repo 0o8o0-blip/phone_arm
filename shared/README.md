@@ -2,8 +2,7 @@
 
 Only code with current callers in multiple runnable components belongs here:
 
-- `webtransport.py` is used by the follower gateway, leader controller and
-  regional server forwarder.
+- `webtransport.py` is used by the follower gateway and leader controller.
 - `leader_protocol.py` defines and validates the wire message used by both the
   leader controller and follower gateway.
 - `usb_arm.py` discovers USB serial adapters and prevents the leader and

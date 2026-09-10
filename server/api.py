@@ -177,7 +177,14 @@ class SessionApi:
         return "asia" if str(value or "").lower() == "asia" else "europe"
 
     @staticmethod
-    def _relay_endpoint(base: str, role: str, session: str, token: str) -> str:
+    def _relay_endpoint(
+        base: str,
+        role: str,
+        session: str,
+        token: str,
+        *,
+        home_edge: str | None = None,
+    ) -> str:
         if base.startswith("wss://"):
             base = "https://" + base[len("wss://") :]
         base = base.rstrip("/")
@@ -185,7 +192,10 @@ class SessionApi:
             base = base.rsplit("/", 1)[0]
         elif not base.endswith("/wt"):
             base += "/wt"
-        return f"{base}/{role}?{urlencode({'session': session, 'token': token})}"
+        query = {"session": session, "token": token}
+        if home_edge:
+            query["home"] = home_edge
+        return f"{base}/{role}?{urlencode(query)}"
 
     def _mint_access(self, *, session: str, expires_at: float) -> str:
         now = time.time()
@@ -265,6 +275,7 @@ class SessionApi:
             "name": display_name,
             "listed": listed,
             "video_available": video_available,
+            "edge": edge,
             "seen_at": now,
             "expires_at": expires_at,
         }
@@ -327,6 +338,7 @@ class SessionApi:
                 "name": str(body.get("name") or body.get("follower_id") or "robot")[:80],
                 "listed": bool(body.get("listed", False)),
                 "video_available": bool(body.get("video_available", True)),
+                "edge": self._edge(body.get("edge")),
                 "expires_at": expiry,
             }
             self.followers[session] = follower
@@ -335,6 +347,9 @@ class SessionApi:
         follower["video_available"] = bool(
             body.get("video_available", follower.get("video_available", True))
         )
+        # Preserve the arm's rendezvous region. Controllers still use their
+        # own nearest ingress relay; that relay routes UDP here when needed.
+        follower["edge"] = self._edge(body.get("edge", follower.get("edge")))
         return web.json_response(
             {"ok": True, "session": session, "lease_s": self.follower_timeout_s},
             headers={"Cache-Control": "no-store"},
@@ -359,7 +374,8 @@ class SessionApi:
     async def webrtc_config(self, request: web.Request) -> web.Response:
         token, follower = self._browser_context(request)
         session = follower["session"]
-        edge = self._edge(request.query.get("edge"))
+        controller_edge = self._edge(request.query.get("edge"))
+        arm_edge = self._edge(follower.get("edge"))
         capability_expiry = min(float(token["expires_at"]), time.time() + 3600)
         video_available = bool(follower.get("video_available", True))
         wants_video = str(request.query.get("want_video") or "1").lower() not in {
@@ -368,7 +384,7 @@ class SessionApi:
         response: dict[str, Any] = {
             "videoAvailable": video_available,
             "iceServers": (
-                [self._turn_credentials(session, edge, capability_expiry)]
+                [self._turn_credentials(session, controller_edge, capability_expiry)]
                 if video_available and wants_video
                 else []
             ),
@@ -405,7 +421,7 @@ class SessionApi:
                     "seen_at": now,
                 }
                 relay_token = self._capability(
-                    "phone", session, capability_expiry
+                    f"phone@{arm_edge}", session, capability_expiry
                 )
                 response.update(
                     {
@@ -414,8 +430,14 @@ class SessionApi:
                         "controlOwnerPageId": page_id,
                         "controlOwnerAgeMs": round((now - claimed_at) * 1000.0, 1),
                         "controlOwnerTimeoutS": OWNER_TIMEOUT_S,
+                        "controlEdge": controller_edge,
+                        "armEdge": arm_edge,
                         "sessionRelayWtUrl": self._relay_endpoint(
-                            self.relay_urls[edge], "phone", session, relay_token
+                            self.relay_urls[controller_edge],
+                            "phone",
+                            session,
+                            relay_token,
+                            home_edge=arm_edge,
                         ),
                         "sessionRelaySession": session,
                     }
@@ -429,19 +451,32 @@ class SessionApi:
     async def leader_config(self, request: web.Request) -> web.Response:
         token, follower = self._browser_context(request)
         session = follower["session"]
-        edge = self._edge(request.query.get("edge"))
+        controller_edge = self._edge(request.query.get("edge"))
+        arm_edge = self._edge(follower.get("edge"))
         relay_token = self._capability(
-            "phone", session, min(float(token["expires_at"]), time.time() + 3600)
+            f"phone@{arm_edge}",
+            session,
+            min(float(token["expires_at"]), time.time() + 3600),
         )
         relay_url = self._relay_endpoint(
-            self.relay_urls[edge], "phone", session, relay_token
+            self.relay_urls[controller_edge],
+            "phone",
+            session,
+            relay_token,
+            home_edge=arm_edge,
         )
         command = (
             "cd ~/dev/phone_arm && ./controllers/leader_arm/run.sh --url "
             + shlex.quote(relay_url)
         )
         return web.json_response(
-            {"mode": "one_to_one", "session": session, "command": command},
+            {
+                "mode": "one_to_one",
+                "session": session,
+                "control_edge": controller_edge,
+                "arm_edge": arm_edge,
+                "command": command,
+            },
             headers={"Cache-Control": "no-store"},
         )
 

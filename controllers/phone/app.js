@@ -109,8 +109,9 @@ function apiFetch(url, options = {}) {
   return fetch(url, { ...options, headers });
 }
 
-// Both regional edges accept both robot and controller roles. Probe their
-// HTTPS endpoints once and use the lower-latency ingress.
+// Probe regional HTTPS endpoints once. The result selects both the controller's
+// QUIC ingress and preferred TURN server. If the arm uses another edge, the two
+// relays carry the long leg over latest-only UDP inside WireGuard.
 let preferredEdge = 'europe';
 async function edgeLatency(name, url) {
   const started = performance.now();
@@ -131,7 +132,7 @@ const edgeSelectionReady = Promise.all([
 ]).then(results => {
   results.sort((a, b) => a.ms - b.ms);
   if (Number.isFinite(results[0].ms)) preferredEdge = results[0].name;
-  log(`nearest relay edge: ${preferredEdge}`);
+  log(`nearest controller edge: ${preferredEdge}`);
 });
 
 function configUrl(extra = {}) {
@@ -835,6 +836,11 @@ async function startControl() {
       _controlTransport = 'relay-webtransport';
       _controlClaimActive = true;
       setClientRole('controller');
+      if (cfg.controlEdge) {
+        const bridge = cfg.armEdge && cfg.armEdge !== cfg.controlEdge
+          ? ` -> ${cfg.armEdge}` : ' (local pair)';
+        log(`control route: ${cfg.controlEdge}${bridge}`);
+      }
       startControlWebTransport(cfg.sessionRelayWtUrl, cfg.sessionRelaySession || 'default');
     })
     .catch((e) => {
@@ -1235,7 +1241,7 @@ async function checkXR() {
 // --- Pose sequence + control downlink tracking ---------------------------
 // These are intentionally separate:
 // - control RX: any downlink datagram, used only for session liveness
-// - edge ack: phone-to-edge app telemetry from the forwarder
+// - edge ack: phone-to-relay-ingress timing (zero-distance on a full relay)
 // - robot ack: end-to-end pose echo from the Pi, used for robot health/timing
 let lastControlRxMs = 0;
 let wsPoseSeq = 0;  // monotonic per-pose sequence number (name is legacy;
@@ -2258,6 +2264,11 @@ function updateBanner(poseValid) {
   let text = '';
   const now = Date.now();
   const ageMs = controlRxAgeMs();
+  // The local edge ACK proves only the short phone-to-edge leg. Robot ACKs
+  // traverse the backbone and prove that the remote edge and arm are alive.
+  const armFeedbackAgeMs = lastRobotAckMs
+    ? now - lastRobotAckMs
+    : (_controlWtSessionStartMs ? now - _controlWtSessionStartMs : 0);
   const ctrlReady = controlReady();
   const serverGateRecent = serverGateLastMs && (now - serverGateLastMs) <= SERVER_GATE_STALE_MS;
   const serverGateActive = serverGateRecent && serverGateState !== 'ok';
@@ -2271,6 +2282,9 @@ function updateBanner(poseValid) {
     // Connection is half-dead or massively congested.
     kind = 'bad';
     text = `NO LINK (${(ageMs/1000).toFixed(1)}s)`;
+  } else if (armFeedbackAgeMs > CONTROL_NO_LINK_MS) {
+    kind = 'bad';
+    text = `NO ARM LINK (${(armFeedbackAgeMs/1000).toFixed(1)}s)`;
   } else if (serverGateActive) {
     kind = serverGateSeverity === 'bad' ? 'bad' : 'warn';
     text = serverGateMessage || 'CONTROL HOLD';

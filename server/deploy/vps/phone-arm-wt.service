@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 Environment=PHONE_ARM_WT_CERT=/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/188-166-154-201.sslip.io/188-166-154-201.sslip.io.crt
 Environment=PHONE_ARM_WT_KEY=/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/188-166-154-201.sslip.io/188-166-154-201.sslip.io.key
-ExecStart=/usr/bin/python3 /opt/phone_arm/relay.py --host 0.0.0.0 --port 4433 --certificate ${PHONE_ARM_WT_CERT} --private-key ${PHONE_ARM_WT_KEY} --event-log /var/log/phone-arm-wt-events.jsonl --capability-secret @/etc/phone_arm/capability_secret --max-datagram-bytes 1024 --stats-interval-s 30
+ExecStart=/usr/bin/python3 /opt/phone_arm/relay.py --host 0.0.0.0 --port 4433 --certificate ${PHONE_ARM_WT_CERT} --private-key ${PHONE_ARM_WT_KEY} --event-log /var/log/phone-arm-wt-events.jsonl --capability-secret @/etc/phone_arm/capability_secret --edge-name europe --backbone-host 10.44.0.1 --backbone-port 7443 --peer-backbone asia=10.44.0.2:7443 --backbone-max-age-ms 150 --max-datagram-bytes 1024 --stats-interval-s 30
 Restart=on-failure
 RestartSec=3
 StandardOutput=journal

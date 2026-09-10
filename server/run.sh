@@ -14,5 +14,12 @@ ARGS=(
   --private-key "$KEY"
   --event-log "${PHONE_ARM_WT_EVENT_LOG:-/tmp/phone_arm_webtransport_relay.jsonl}"
   --capability-secret "$CAPABILITY_SECRET"
+  --edge-name "${PHONE_ARM_EDGE_NAME:-europe}"
+  --backbone-host "${PHONE_ARM_BACKBONE_HOST:-127.0.0.1}"
+  --backbone-port "${PHONE_ARM_BACKBONE_PORT:-7443}"
+  --backbone-max-age-ms "${PHONE_ARM_BACKBONE_MAX_AGE_MS:-150}"
 )
+if [ -n "${PHONE_ARM_PEER_BACKBONE:-}" ]; then
+  ARGS+=(--peer-backbone "$PHONE_ARM_PEER_BACKBONE")
+fi
 exec python3 -m server.relay "${ARGS[@]}"

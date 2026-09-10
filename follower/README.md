@@ -37,6 +37,10 @@ directory. Multiple followers use independent control and video paths. A
 temporary disconnect marks a follower offline but does not delete its session;
 session state is removed only after the advertised session expiry.
 
+The follower and controller independently choose their nearest regional relay.
+When those regions differ, the relays carry the inter-region leg over a separate
+latest-only UDP path inside WireGuard.
+
 Startup also lists every detected camera and a **No camera** option. The chosen
 camera is published for that session. With **No camera**, arm control still
 works and the browser reports that video is unavailable without retrying it.

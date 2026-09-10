@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import queue
 import tempfile
 import time
@@ -14,7 +15,8 @@ from aiohttp.test_utils import make_mocked_request
 from follower.gateway import BrowserPhone, STALE_POSE_TIMEOUT_MS, _RecorderProxy
 from server.api import OWNER_TIMEOUT_S, SessionApi, _token_hash
 from server.capabilities import issue, verify
-from server.relay import ControlPeer, ControlRelay
+import server.relay as relay_module
+from server.relay import BackbonePacket, BackboneProtocol, ControlPeer, ControlRelay
 
 
 class CapabilityTests(unittest.TestCase):
@@ -90,6 +92,7 @@ class SessionApiTests(unittest.IsolatedAsyncioTestCase):
             "name": "robot",
             "listed": False,
             "video_available": False,
+            "edge": "asia",
             "seen_at": now,
             "expires_at": now + 600,
         }
@@ -105,14 +108,47 @@ class SessionApiTests(unittest.IsolatedAsyncioTestCase):
         first_body = json.loads((await self.api.webrtc_config(first)).body)
         second_body = json.loads((await self.api.webrtc_config(second)).body)
         self.assertEqual(first_body["controlRole"], "controller")
+        self.assertEqual(first_body["controlEdge"], "europe")
+        self.assertEqual(first_body["armEdge"], "asia")
+        self.assertIn("eu.test", first_body["sessionRelayWtUrl"])
+        self.assertIn("home=asia", first_body["sessionRelayWtUrl"])
         self.assertEqual(second_body["controlRole"], "viewer")
 
         self.api.owners[session]["seen_at"] -= OWNER_TIMEOUT_S + 1
         second_body = json.loads((await self.api.webrtc_config(second)).body)
         self.assertEqual(second_body["controlRole"], "controller")
 
+        local = make_mocked_request(
+            "GET", "/webrtc/config?want_control=1&page_id=second&edge=asia",
+            headers={"Authorization": f"Bearer {access}"},
+        )
+        local_body = json.loads((await self.api.webrtc_config(local)).body)
+        self.assertEqual(local_body["controlEdge"], "asia")
+        self.assertEqual(local_body["armEdge"], "asia")
+        self.assertIn("asia.test", local_body["sessionRelayWtUrl"])
+        self.assertIn("home=asia", local_body["sessionRelayWtUrl"])
+
 
 class RelaySessionTests(unittest.TestCase):
+    def test_phone_capability_is_bound_to_arm_edge(self) -> None:
+        relay = ControlRelay(capability_secret="secret")
+        token = issue(
+            "secret",
+            role="phone@asia",
+            session="r_abcdefghijkl",
+            expires_at=time.time() + 60,
+        )
+        self.assertIsNotNone(
+            relay.authorize(
+                "phone", token, "r_abcdefghijkl", home_edge="asia"
+            )
+        )
+        self.assertIsNone(
+            relay.authorize(
+                "phone", token, "r_abcdefghijkl", home_edge="europe"
+            )
+        )
+
     def test_session_is_kept_until_latest_observed_capability_expires(self) -> None:
         relay = ControlRelay(capability_secret="secret")
         session = relay.get_session("r_abcdefghijkl", 101)
@@ -133,6 +169,92 @@ class RelaySessionTests(unittest.TestCase):
         self.assertIn(session.name, relay.sessions)
         relay.prune_expired(200)
         self.assertNotIn(session.name, relay.sessions)
+
+
+
+class BackboneTests(unittest.IsolatedAsyncioTestCase):
+    async def test_backbone_sends_only_latest_pending_command(self) -> None:
+        class Transport:
+            def __init__(self) -> None:
+                self.sent: list[tuple[bytes, tuple[str, int]]] = []
+
+            def sendto(self, data: bytes, destination: tuple[str, int]) -> None:
+                self.sent.append((data, destination))
+
+        protocol = BackboneProtocol(max_age_ms=250)
+        transport = Transport()
+        protocol.transport = transport
+        packet_one = BackbonePacket(
+            1, 100, 1, 1000, "europe", "r_abcdefghijkl", "token", b"one"
+        )
+        packet_two = BackbonePacket(
+            1, 100, 2, 1001, "europe", "r_abcdefghijkl", "token", b"two"
+        )
+        with patch.dict(relay_module.PEER_BACKBONES, {"asia": ("10.44.0.2", 7443)}):
+            protocol.send_control("asia", packet_one)
+            protocol.send_control("asia", packet_two)
+            await asyncio.sleep(0)
+
+        self.assertEqual(len(transport.sent), 1)
+        decoded = BackbonePacket.decode(transport.sent[0][0])
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded.sequence, 2)
+        self.assertEqual(decoded.payload, b"two")
+
+    def test_backbone_packet_round_trip(self) -> None:
+        packet = BackbonePacket(
+            2, 123, 456, 789, "asia", "r_abcdefghijkl", "", b'{"ok":true}'
+        )
+        self.assertEqual(BackbonePacket.decode(packet.encode()), packet)
+
+    def test_backbone_drops_over_age_packet(self) -> None:
+        protocol = BackboneProtocol(max_age_ms=100)
+        packet = BackbonePacket(
+            2, 1, 1, int(time.time() * 1000) - 101,
+            "asia", "r_abcdefghijkl", "", b"feedback",
+        )
+        with patch.dict(relay_module.PEER_BACKBONES, {"asia": ("10.44.0.2", 7443)}):
+            protocol.datagram_received(packet.encode(), ("10.44.0.2", 7443))
+        self.assertEqual(protocol.drop_counts["expired"], 1)
+
+    def test_backbone_drops_packet_too_far_in_future(self) -> None:
+        protocol = BackboneProtocol(max_age_ms=150)
+        packet = BackbonePacket(
+            2, 1, 1, int(time.time() * 1000) + 101,
+            "asia", "r_abcdefghijkl", "", b"feedback",
+        )
+        with patch.dict(relay_module.PEER_BACKBONES, {"asia": ("10.44.0.2", 7443)}):
+            protocol.datagram_received(packet.encode(), ("10.44.0.2", 7443))
+        self.assertEqual(protocol.drop_counts["clock_skew"], 1)
+
+    def test_backbone_routing_fields_must_be_ascii(self) -> None:
+        packet = BackbonePacket(
+            1, 1, 1, 1, "europé", "r_abcdefghijkl", "token", b"pose"
+        )
+        with self.assertRaises(ValueError):
+            packet.encode()
+
+    def test_close_before_reordered_data_leaves_epoch_tombstone(self) -> None:
+        protocol = BackboneProtocol(max_age_ms=250)
+        session = "r_abcdefghijkl"
+        token = issue(
+            "secret",
+            role="phone@europe",
+            session=session,
+            expires_at=time.time() + 60,
+        )
+        close = BackbonePacket(
+            3, 10, 3, int(time.time() * 1000), "asia", session, token, b""
+        )
+        delayed = BackbonePacket(
+            1, 10, 2, int(time.time() * 1000), "asia", session, token, b"pose"
+        )
+        relay = ControlRelay(capability_secret="secret")
+        with patch.object(relay_module, "CONTROL_RELAY", relay):
+            protocol._receive_close(close)
+            protocol._receive_control(delayed)
+        self.assertEqual(protocol.drop_counts["closed_epoch"], 1)
+        self.assertNotIn(("asia", session), protocol.remote_phones)
 
 
 class TrajectoryProxyTests(unittest.TestCase):

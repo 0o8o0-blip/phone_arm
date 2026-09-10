@@ -158,6 +158,7 @@ def register(state: dict) -> dict:
             "name": state["name"],
             "listed": state["listed"],
             "video_available": state.get("video_available", True),
+            "edge": state.get("edge", "europe"),
         },
         str(state["registration_token"]),
     )

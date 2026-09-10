@@ -13,9 +13,11 @@ secrets, SSH keys, open ports or tunnels.
 - `mediamtx` provides an independent video path for each active robot.
 - `coturn` accepts short-lived TURN REST credentials issued by the API.
 
-The Singapore host at `146.190.104.81` runs a symmetric WebTransport edge and
-a second coturn instance. Robots and controllers independently select their
-nearest control edge. Browser media is TURN-only and receives both regional
+The Singapore host at `146.190.104.81` runs a full WebTransport relay and a
+second coturn instance. Robots and controllers independently select their
+nearest relay. Same-region peers are paired locally; for different regions,
+the controller's ingress relay sends latest-only UDP through WireGuard to the
+arm's relay. Browser media is TURN-only and receives both regional
 servers with the nearest one listed first.
 
 ## Session model
@@ -60,8 +62,16 @@ mode 0600, and restart coturn. Never commit the rendered file.
 
 ## Deploy
 
-Deploy the Python entry points, `capabilities.py`, and units to `/opt/phone_arm` and
-`/etc/systemd/system`, copy `controllers/phone/` to
+Deploy the Python entry points, `capabilities.py`, and units to `/opt/phone_arm`
+and `/etc/systemd/system`, copy `controllers/phone/` to
 `/opt/phone_arm/static/`, validate Caddy before reloading it, and restart API,
 relay and MediaMTX in that order. Preserve the previous Caddy and MediaMTX
 files as rollback copies during a live cutover.
+
+The London relay binds its backbone socket to WireGuard address `10.44.0.1`
+on UDP port 7443. Install `wg0.conf.template` as `/etc/wireguard/wg0.conf`
+after replacing the key placeholders, enable `wg-quick@wg0`, and keep the
+backbone socket unreachable from public interfaces. Both servers should run
+chrony; packets more than 150 ms older than the receiving edge are discarded.
+Keep that deadline above the route's normal one-way latency plus clock error,
+but below the arm's 250 ms stale-command hold.

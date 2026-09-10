@@ -1,0 +1,16 @@
+[Unit]
+Description=Phone Arm WebTransport control relay (Asia)
+After=network-online.target caddy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/wt-venv/bin/python /opt/phone_arm/relay.py --host 0.0.0.0 --port 4434 --certificate /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/146-190-104-81.sslip.io/146-190-104-81.sslip.io.crt --private-key /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/146-190-104-81.sslip.io/146-190-104-81.sslip.io.key --event-log /var/log/phone-arm-wt-relay-events.jsonl --capability-secret @/etc/phone_arm/capability_secret --edge-name asia --backbone-host 10.44.0.2 --backbone-port 7443 --peer-backbone europe=10.44.0.1:7443 --backbone-max-age-ms 150 --max-datagram-bytes 1024 --stats-interval-s 30
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SupplementaryGroups=caddy
+
+[Install]
+WantedBy=multi-user.target
