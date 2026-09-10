@@ -22,16 +22,16 @@
   #invite-url { width: 100%; padding: 12px; color: #eee; background: #181818; border: 1px solid #555; border-radius: 8px; user-select: text; -webkit-user-select: text; }
   #open-invite-btn { padding: 12px; border: 0; border-radius: 8px; background: #2c8; color: #00150e; font-weight: 700; }
   #mode-actions { margin-top: auto; display: grid; gap: 12px; }
-  #start-btn, #leader-btn { padding: 20px; border: none; border-radius: 12px; font-size: 19px; font-weight: 600; }
+  #start-btn, #leader-btn, #watch-btn { padding: 20px; border: none; border-radius: 12px; font-size: 19px; font-weight: 600; }
   #start-btn { background: #2c8; color: #000; }
   #leader-btn { background: #6cf; color: #00131c; }
-  #start-btn:disabled { background: #555; color: #888; }
+  #watch-btn { background: #333; color: #eee; }
+  #start-btn:disabled, #leader-btn:disabled, #watch-btn:disabled { background: #555; color: #888; }
   #leader-panel { display: none; background: #111; border: 1px solid #345; border-radius: 10px; padding: 14px; gap: 10px; }
   #leader-panel.show { display: grid; }
   #leader-panel pre { user-select: text; -webkit-user-select: text; white-space: pre-wrap; overflow-wrap: anywhere; }
   #leader-panel button { padding: 12px; border: 0; border-radius: 8px; font-weight: 600; }
   #copy-leader-btn { background: #6cf; color: #00131c; }
-  #watch-leader-btn { background: #333; color: #eee; }
   #xr-support { font-size: 14px; padding: 12px; background: #111; border-radius: 8px; }
   #xr-support.ok { color: #2c8; }
   #xr-support.bad { color: #f55; }
@@ -184,12 +184,12 @@
     <p>Run this on the computer with your leader arm. It will list the connected arms and ask which one to use.</p>
     <pre id="leader-command">Loading command…</pre>
     <button id="copy-leader-btn">Copy command</button>
-    <button id="watch-leader-btn">Watch robot video</button>
   </div>
   <div id="log"></div>
   <div id="mode-actions">
     <button id="start-btn" disabled>Control with phone</button>
     <button id="leader-btn">Control with leader arm</button>
+    <button id="watch-btn" disabled>Watch robot video</button>
   </div>
 </div>
 
@@ -209,6 +209,6 @@
 </div>
 
 <script src="/static/native-bridge.js?v=20260910a"></script>
-<script src="/static/app.js?v=20260910a"></script>
+<script src="/static/app.js?v=20260910b"></script>
 </body>
 </html>

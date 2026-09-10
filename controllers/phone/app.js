@@ -19,10 +19,10 @@ const inviteUrlInput = $('invite-url');
 const openInviteBtn = $('open-invite-btn');
 const startBtn = $('start-btn');
 const leaderBtn = $('leader-btn');
+const watchBtn = $('watch-btn');
 const leaderPanel = $('leader-panel');
 const leaderCommandEl = $('leader-command');
 const copyLeaderBtn = $('copy-leader-btn');
-const watchLeaderBtn = $('watch-leader-btn');
 const stopBtn = $('stop-btn');
 const b1El = $('b1');
 const gripperWrap = $('gripper-wrap');
@@ -35,7 +35,7 @@ const followFillEl = $('follow-fill');
 const logEl = $('log');
 
 // Keep this short because it is also stamped onto control datagrams.
-const APP_SCHEMA_ID = '20260910a';
+const APP_SCHEMA_ID = '20260910b';
 const APP_BOOT_MS = Date.now();
 const APP_SCRIPT_SRC = document.currentScript ? document.currentScript.src : '';
 const APP_PAGE_ID = (() => {
@@ -1154,6 +1154,13 @@ function showLanding(show) {
   landing.style.display = show ? 'flex' : 'none';
 }
 
+function updateLandingActionState() {
+  const authenticated = Boolean(authToken());
+  startBtn.disabled = !authenticated || FORCE_VIEWER || !xrSupported;
+  leaderBtn.disabled = !authenticated;
+  watchBtn.disabled = !authenticated;
+}
+
 function startViewer(reason = 'viewer') {
   releaseControlClaim(reason);
   stopControl();
@@ -1174,7 +1181,7 @@ function stopViewer() {
   setClientRole(FORCE_VIEWER ? 'viewer' : 'unknown');
   overlay.classList.remove('active', 'viewer', 'warn', 'bad');
   showLanding(true);
-  startBtn.disabled = false;
+  updateLandingActionState();
 }
 
 function log(msg) {
@@ -1981,7 +1988,7 @@ function endControllerSession(reason, nextRole = FORCE_VIEWER ? 'viewer' : 'unkn
   overlay.classList.remove('active', 'warn', 'bad');
   showLanding(true);
   setClientRole(nextRole);
-  startBtn.disabled = false;
+  updateLandingActionState();
 }
 
 function startNativeTracking() {
@@ -2332,12 +2339,7 @@ function startFromButton() {
     startNativeTracking();
     return;
   }
-  if (FORCE_VIEWER || !xrSupported) {
-    startBtn.disabled = true;
-    startViewer(FORCE_VIEWER ? 'forced_viewer' : 'no_ar');
-    return;
-  }
-  startXR();
+  if (xrSupported && !FORCE_VIEWER) startXR();
 }
 
 async function showLeaderSetup() {
@@ -2364,7 +2366,7 @@ async function showLeaderSetup() {
     leaderCommandEl.textContent = `Could not load leader command: ${e.message || e}`;
     log(`leader-arm setup failed: ${e.message || e}`);
   } finally {
-    leaderBtn.disabled = false;
+    updateLandingActionState();
   }
 }
 
@@ -2380,21 +2382,19 @@ copyLeaderBtn.addEventListener('click', async () => {
     log(`copy failed: ${e.message || e}`);
   }
 });
-watchLeaderBtn.addEventListener('click', () => startViewer('leader_arm'));
+watchBtn.addEventListener('click', () => startViewer('main_page'));
 
 function autoStartViewer(reason) {
   setTimeout(() => {
     if (xrSession || clientRole === 'controller' || video.shouldReconnect || video.starting) return;
-    startBtn.disabled = true;
+    watchBtn.disabled = true;
     startViewer(reason);
   }, 0);
 }
 
 checkXR().then((ok) => {
   xrSupported = ok;
-  startBtn.disabled = !authToken();
-  leaderBtn.disabled = !authToken();
-  startBtn.textContent = (FORCE_VIEWER || !ok) ? 'Watch Video' : 'Control with phone';
+  updateLandingActionState();
   startBtn.addEventListener('click', startFromButton);
   if (FORCE_VIEWER && authToken()) {
     autoStartViewer('forced_viewer');
@@ -2403,9 +2403,7 @@ checkXR().then((ok) => {
   xrSupported = false;
   supportEl.textContent = 'Viewer mode: robot video only.';
   supportEl.className = 'ok';
-  startBtn.disabled = !authToken();
-  leaderBtn.disabled = !authToken();
-  startBtn.textContent = 'Watch Video';
+  updateLandingActionState();
   startBtn.addEventListener('click', startFromButton);
   if (FORCE_VIEWER && authToken()) autoStartViewer('forced_viewer');
 });
