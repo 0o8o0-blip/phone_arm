@@ -11,5 +11,4 @@ viewer. The root page accepts a complete invitation URL, which also makes an
 installed Home Screen web app usable without embedding a session secret in its
 manifest.
 
-The follower gateway serves these files locally and they are copied to the
-hosted web endpoint in the current deployment.
+These files are deployed to the hosted web endpoint alongside the session API.

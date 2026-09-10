@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hmac
 import json
 import logging
 import os
@@ -248,30 +247,20 @@ class ControlRelay:
     def __init__(
         self,
         *,
-        phone_secret: str = "",
-        arm_secret: str = "",
-        capability_secret: str = "",
+        capability_secret: str,
         max_datagram_bytes: int = 1024,
     ) -> None:
-        self.role_secrets = {"phone": phone_secret, "arm": arm_secret}
         self.capability_secret = capability_secret
         self.max_datagram_bytes = max_datagram_bytes
         self.sessions: dict[str, ControlSession] = {}
 
     def authorized(self, role: str, token: str, session: str) -> bool:
-        if self.capability_secret and verify_capability(
+        return verify_capability(
             self.capability_secret,
             token,
             role=role,
             session=session,
-        ):
-            return True
-        secret = self.role_secrets.get(role, "")
-        if secret:
-            return hmac.compare_digest(token or "", secret)
-        if not self.capability_secret:
-            return True
-        return False
+        )
 
     def get_session(self, name: str) -> ControlSession:
         session = self.sessions.get(name)
@@ -745,11 +734,10 @@ async def main() -> None:
     parser.add_argument("--private-key", required=True)
     parser.add_argument("--event-log", default="")
     parser.add_argument("--stats-interval-s", type=float, default=5.0)
-    parser.add_argument("--phone-secret", default=os.environ.get("PHONE_ARM_WT_PHONE_SECRET", ""))
-    parser.add_argument("--arm-secret", default=os.environ.get("PHONE_ARM_WT_ARM_SECRET", ""))
     parser.add_argument(
         "--capability-secret",
         default=os.environ.get("PHONE_ARM_CAPABILITY_SECRET", ""),
+        required=not bool(os.environ.get("PHONE_ARM_CAPABILITY_SECRET", "")),
     )
     parser.add_argument("--max-datagram-bytes", type=int, default=int(os.environ.get("PHONE_ARM_WT_MAX_DATAGRAM_BYTES", "1024")))
     parser.add_argument("--verbose", action="store_true")
@@ -757,16 +745,10 @@ async def main() -> None:
 
     global CONTROL_RELAY, EVENT_LOG_PATH
     EVENT_LOG_PATH = args.event_log
-    phone_secret = _read_secret_arg(args.phone_secret)
-    arm_secret = _read_secret_arg(args.arm_secret)
     capability_secret = _read_secret_arg(args.capability_secret)
-    if not capability_secret and (not phone_secret or not arm_secret):
-        parser.error(
-            "--capability-secret or both legacy role secrets are required"
-        )
+    if not capability_secret:
+        parser.error("--capability-secret must not be empty")
     CONTROL_RELAY = ControlRelay(
-        phone_secret=phone_secret,
-        arm_secret=arm_secret,
         capability_secret=capability_secret,
         max_datagram_bytes=max(1, args.max_datagram_bytes),
     )

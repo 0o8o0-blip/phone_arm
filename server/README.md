@@ -26,19 +26,15 @@ The launcher accepts these environment variables:
 - `PHONE_ARM_WT_HOST` and `PHONE_ARM_WT_PORT`
 - `PHONE_ARM_WT_CERT` and `PHONE_ARM_WT_KEY`
 - `PHONE_ARM_WT_EVENT_LOG`
-- `PHONE_ARM_CAPABILITY_SECRET` (recommended)
-- `PHONE_ARM_WT_PHONE_SECRET` and `PHONE_ARM_WT_ARM_SECRET` (legacy fallback)
+- `PHONE_ARM_CAPABILITY_SECRET` (required)
 
 Secret values may be literal tokens or `@/path/to/token-file`. Production uses
 one server-only capability-signing secret shared by the API and relay. It is
-never copied to followers or controllers. The two legacy role secrets remain
-available only for local compatibility.
+never copied to followers or controllers.
 
 ```sh
 mkdir -p server/secrets
 openssl rand -hex 32 > server/secrets/capability.token
-openssl rand -hex 32 > server/secrets/phone.token
-openssl rand -hex 32 > server/secrets/arm.token
 PHONE_ARM_CAPABILITY_SECRET=@server/secrets/capability.token ./server/run.sh
 ```
 

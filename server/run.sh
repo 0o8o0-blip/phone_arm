@@ -5,9 +5,7 @@ cd "$REPO_ROOT"
 
 CERT="${PHONE_ARM_WT_CERT:-server/certs/server.crt}"
 KEY="${PHONE_ARM_WT_KEY:-server/certs/server.key}"
-PHONE_SECRET="${PHONE_ARM_WT_PHONE_SECRET:-@server/secrets/phone.token}"
-ARM_SECRET="${PHONE_ARM_WT_ARM_SECRET:-@server/secrets/arm.token}"
-CAPABILITY_SECRET="${PHONE_ARM_CAPABILITY_SECRET:-}"
+CAPABILITY_SECRET="${PHONE_ARM_CAPABILITY_SECRET:-@server/secrets/capability.token}"
 
 ARGS=(
   --host "${PHONE_ARM_WT_HOST:-0.0.0.0}"
@@ -15,10 +13,6 @@ ARGS=(
   --certificate "$CERT"
   --private-key "$KEY"
   --event-log "${PHONE_ARM_WT_EVENT_LOG:-/tmp/phone_arm_webtransport_relay.jsonl}"
-  --phone-secret "$PHONE_SECRET"
-  --arm-secret "$ARM_SECRET"
+  --capability-secret "$CAPABILITY_SECRET"
 )
-if [ -n "$CAPABILITY_SECRET" ]; then
-  ARGS+=(--capability-secret "$CAPABILITY_SECRET")
-fi
 exec python3 -m server.relay "${ARGS[@]}"

@@ -18,7 +18,6 @@ BrowserPhone.connect():
      - is the arm-side WebTransport client -- pose datagrams flow relay
        -> here -> _ingest_pose_msg -> IPC to main
      - owns SessionRecorder for pose.csv + debug.csv + events.jsonl
-     - can serve a local development API when hosted mode is disabled
 
   2. Trajectory writer subprocess (_trajectory_writer_process_main)
      - takes IK-tick trajectory rows over an mp.Queue, appends to
@@ -57,11 +56,6 @@ import io
 import json
 import os as _os
 import queue as _queue
-import signal
-import shlex
-import socket
-import ssl
-import subprocess
 import sys
 import threading
 import time
@@ -75,13 +69,12 @@ import threading as _threading
 from datetime import datetime as _datetime, timezone as _timezone
 
 import numpy as np
-from aiohttp import web
 from scipy.spatial.transform import Rotation
 
 from shared.leader_protocol import LEADER_MESSAGE_TYPE, parse_leader_positions
 
 
-# Per-session recorder. The browser/control server owns pose/events and the
+# Per-session recorder. The network process owns pose/events and the
 # robot process writes trajectory rows through _RecorderProxy.
 _ACTIVE_RECORDER: "SessionRecorder | None" = None
 
@@ -365,7 +358,7 @@ class _TrajectorySessionRecorder:
 
     This owns only trajectory.csv.  Pose/debug/events stay with SessionRecorder and
     video stays with the video worker, so a large trajectory file cannot fill
-    the browser/control server's recorder queue.
+    the network process's recorder queue.
     """
 
     def __init__(self, session_dir: str | Path) -> None:
@@ -404,7 +397,7 @@ class _RecorderProxy:
     follower.main records trajectory rows through gateway._ACTIVE_RECORDER.
     After the browser server moves to a child process, pose/events live there
     and trajectory.csv lives in a dedicated writer process.  This proxy sends
-    trajectory rows directly to that writer so the browser/control server never
+    trajectory rows directly to that writer so the network process never
     competes with high-volume CSV output.
     """
 
@@ -611,11 +604,6 @@ def _trajectory_writer_process_main(command_queue, status_queue) -> None:
             pass
 
 
-@dataclass
-class PhoneConfig:
-    camera_offset = np.array([0.0, -0.02, 0.04])
-
-
 def check_if_already_connected(fn):
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
@@ -625,17 +613,11 @@ def check_if_already_connected(fn):
 
     return wrapper
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-CERTS_DIR = Path(__file__).resolve().parent / "certs"
-STATIC_DIR = REPO_ROOT / "controllers" / "phone"
-
-DEFAULT_PORT = 8443
-
 # Pinned by by-PATH (physical USB port), NOT by-id: the generic Realtek 0bda:5844
 # cams all report the SAME fake serial (200901010001), so their by-id symlink
 # collides when two are plugged and flips unpredictably. by-path is unambiguous
 # and stable -- as long as each cam stays in its current port. The shell video
-# publisher imports VIDEO_DEVICE below to pick the default ffmpeg input.
+# `follower/run.sh` uses this registry to select the ffmpeg input.
 _REALFLEX_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.0-usb-0:1.4:1.0-video-index0"   # port 1.4
 _CAM2_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.1.2:1.0-video-index0"     # port 1.1.2 (added 2026-05-28)
 _CAM3_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.1.4:1.0-video-index0"     # port 1.1.4 (added 2026-05-29)
@@ -663,65 +645,16 @@ def _present_cameras() -> list[tuple[str, str, str]]:
     return cameras
 
 
-def _default_video_device() -> str:
-    present = _present_cameras()
-    return present[0][2] if present else _REALFLEX_DEVICE
-
-
-# Robot camera video. This is deliberately the robot camera stream shown
-# over the WebXR AR passthrough so the phone camera is not visible to the user.
-VIDEO_DEVICE = _default_video_device()
-# Static TURN settings are used only by the local development server below.
-# Hosted sessions receive temporary regional TURN credentials from the VPS API.
-TURN_URL = _os.environ.get("PHONE_ARM_TURN_URL", "")
-TURN_USER = _os.environ.get("PHONE_ARM_TURN_USER", "")
-TURN_PW = _os.environ.get("PHONE_ARM_TURN_PW", "")
-# Optional phone-facing override for the local development server.
-TURN_URL_PHONE = _os.environ.get("PHONE_ARM_TURN_URL_PHONE", "") or TURN_URL
-ALLOW_NO_TURN_FOR_LOCAL_REPRO = (
-    _os.environ.get("PHONE_ARM_ALLOW_NO_TURN_FOR_LOCAL_REPRO", "").strip() == "1"
-)
-TURN_URLS_PHONE = [TURN_URL_PHONE] if TURN_URL_PHONE else []
-
-# Public URL the phone connects to. In normal hosted operation, Caddy serves
-# the controller and the VPS API supplies its session configuration. The local
-# HTTPS server remains available only as a development fallback.
-VPS_PUBLIC_URL = "https://188-166-154-201.sslip.io"
-HOSTED_API_URL = _os.environ.get("PHONE_ARM_HOSTED_API_URL", "").strip()
-
 # Session-relay WebTransport control transport.
-# The arm connects OUTBOUND as an "arm" peer to SESSION_RELAY_WT_URL; the
-# operator's browser connects as a "phone" peer to SESSION_RELAY_WT_URL_PHONE
-# (which may point to a different edge for geo-optimized routing). All pose
-# datagrams flow phone -> forwarder(s) -> relay -> arm. Video is separate WHEP
-# through MediaMTX/TURN.
+# The arm connects OUTBOUND as an "arm" peer. The hosted API independently
+# gives the controller a phone-role endpoint and temporary capability.
 SESSION_RELAY_ARM_TOKEN = _os.environ.get("PHONE_ARM_SESSION_RELAY_ARM_TOKEN", "").strip()
-SESSION_RELAY_PHONE_TOKEN = _os.environ.get("PHONE_ARM_SESSION_RELAY_PHONE_TOKEN", "").strip()
 SESSION_RELAY_SESSION = _os.environ.get("PHONE_ARM_SESSION_RELAY_SESSION", "default").strip() or "default"
 SESSION_RELAY_WT_URL = _os.environ.get("PHONE_ARM_SESSION_RELAY_WT_URL", "").strip()
-# Phone-facing override: when Pi and operator should hit DIFFERENT WT
-# endpoints (Pi connects to a London-local relay for low latency, operator
-# connects to a Singapore forwarder near them). Empty -> phone uses
-# SESSION_RELAY_WT_URL too (single-relay topology).
-SESSION_RELAY_WT_URL_PHONE = _os.environ.get("PHONE_ARM_SESSION_RELAY_WT_URL_PHONE", "").strip()
-
-# MediaMTX SFU for robot video. /webrtc/config advertises this WHEP endpoint
-# and subscriber token; app.js uses it as the only robot-video path.
-MEDIAMTX_WHEP_URL = _os.environ.get(
-    "PHONE_ARM_MEDIAMTX_WHEP_URL", "").strip()
-MEDIAMTX_PLAY_TOKEN = _os.environ.get(
-    "PHONE_ARM_MEDIAMTX_PLAY_TOKEN", "").strip()
 
 
-def _session_relay_wt_url(role: str, *, base_override: str | None = None) -> str:
-    # Phone role can override to a separate edge URL when a forwarder is in
-    # use; arm always uses the canonical SESSION_RELAY_WT_URL so the Pi can
-    # connect directly to the real relay.
-    base = base_override or (
-        SESSION_RELAY_WT_URL_PHONE
-        if role == "phone" and SESSION_RELAY_WT_URL_PHONE
-        else SESSION_RELAY_WT_URL
-    )
+def _session_relay_wt_url() -> str:
+    base = SESSION_RELAY_WT_URL
     if not base:
         return ""
     if base.startswith("wss://"):
@@ -732,10 +665,9 @@ def _session_relay_wt_url(role: str, *, base_override: str | None = None) -> str
     elif not base.endswith("/wt"):
         base = base + "/wt"
     qs = {"session": SESSION_RELAY_SESSION}
-    token = SESSION_RELAY_ARM_TOKEN if role == "arm" else SESSION_RELAY_PHONE_TOKEN
-    if token:
-        qs["token"] = token
-    return f"{base}/{role}?{_urlparse.urlencode(qs)}"
+    if SESSION_RELAY_ARM_TOKEN:
+        qs["token"] = SESSION_RELAY_ARM_TOKEN
+    return f"{base}/arm?{_urlparse.urlencode(qs)}"
 
 
 def _allow_system_dist_packages_for_aioquic() -> None:
@@ -754,16 +686,6 @@ def _allow_system_dist_packages_for_aioquic() -> None:
     for path in candidates:
         if path not in sys.path and Path(path).exists():
             sys.path.append(path)
-
-# Token-based auth. If this file exists, every request must include a valid
-# ?t=TOKEN query param (except /healthz). If it does NOT exist, the server runs
-# unauthenticated -- backwards-compatible default for first runs. Tokens are
-# managed via follower/mint_token.py; the server reloads on SIGHUP so revocations are
-# instant without a teleop restart. File format: a JSON array of
-#   {"value": str, "name": str, "expires_at": float|null}
-# where expires_at is a unix timestamp (null = never expires).
-TOKENS_FILE = Path.home() / ".phone_arm_tokens.json"
-
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -785,7 +707,6 @@ INCIDENT_RELAY_SEGMENT_MS = _env_float(
     "PHONE_ARM_INCIDENT_RELAY_SEGMENT_MS",
     STALE_POSE_TIMEOUT_MS,
 )
-CONTROL_OWNER_TIMEOUT_S = _env_float("PHONE_ARM_CONTROL_OWNER_TIMEOUT_S", 15.0)
 # ARCore/WebXR can relocalize and jump the reported pose while still claiming
 # pose_valid=true. If that happens with B1 held, freeze phone motion so we don't
 # command a huge target. The operator must release and reengage B1 to resume.
@@ -865,33 +786,11 @@ class _FaultRecovery:
         self.latch_details = None
 
 
-def _ensure_cert() -> tuple[Path, Path]:
-    cert = CERTS_DIR / "server.crt"
-    key = CERTS_DIR / "server.key"
-    if cert.exists() and key.exists():
-        return cert, key
-    CERTS_DIR.mkdir(parents=True, exist_ok=True)
-    hostname = socket.gethostname()
-    # This certificate is used only by the optional local development server.
-    sans = ["DNS:localhost", f"DNS:{hostname}", "IP:127.0.0.1"]
-    san_str = ",".join(sans)
-    subprocess.run(
-        [
-            "openssl", "req", "-x509", "-nodes", "-newkey", "rsa:2048",
-            "-keyout", str(key), "-out", str(cert),
-            "-days", "3650", "-subj", f"/CN={hostname}",
-            "-addext", f"subjectAltName={san_str}",
-        ],
-        check=True,
-    )
-    return cert, key
-
-
 class BrowserPhone:
     """Browser-backed phone teleoperator.
 
-    Runs the browser/control aiohttp server in a subprocess. Last-received pose
-    is held under a lock and surfaced via get_action() to the teleop loop.
+    Runs the arm-side WebTransport client in a subprocess. Last-received pose is
+    held under a lock and surfaced via get_action() to the teleop loop.
 
     On B1 rising edge (operator first presses the hold button), we re-zero
     the calibration (the phone's current pose becomes neutral). This is
@@ -899,12 +798,7 @@ class BrowserPhone:
     """
 
     name = "browser_phone"
-    config_class = PhoneConfig
-
-    def __init__(self, config: PhoneConfig, port: int = DEFAULT_PORT):
-        self.config = config
-        self.port = port
-
+    def __init__(self):
         self._state_lock = threading.Lock()
         self._feedback_lock = threading.Lock()
         self._latest_msg: dict | None = None
@@ -969,10 +863,8 @@ class BrowserPhone:
         self._dc_last_browser_t_ms: float | None = None
 
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._runner: web.AppRunner | None = None
-        self._site: web.TCPSite | None = None
         self._ready_event = threading.Event()
-        # Process isolation is permanent: the browser/control server and
+        # Process isolation is permanent: the network client and
         # trajectory writer both run outside the robot-control loop.
         self._server_process = None
         self._action_ipc_queue = None
@@ -987,24 +879,11 @@ class BrowserPhone:
         self._trajectory_ipc_queue = None
         self._trajectory_status_queue = None
 
-        # Token auth -- populated by _load_tokens() at server startup and via
-        # SIGHUP. Empty list + _auth_enabled=False = no token file = no auth.
-        self._tokens: list[dict] = []
-        self._auth_enabled = False
         self._control_reacquire_required = False
         self._control_reacquire_reason: str | None = None
         self._relay_task: asyncio.Task | None = None
         self._relay_stats_task: asyncio.Task | None = None
         self._relay_epoch_seen: int | None = None
-        # Browser-side control ownership. Video is multi-subscriber via
-        # MediaMTX, but only one browser should ever receive the WebTransport
-        # phone-role URL. Same page can reconnect; a new page can claim only
-        # after the active owner lease goes quiet.
-        self._control_owner_page_id: str | None = None
-        self._control_owner_name: str | None = None
-        self._control_owner_claim_ms = 0.0
-        self._control_owner_seen_ms = 0.0
-
         # Calibration baseline. Updated on B1 rising edge.
         self._calib_pos = np.zeros(3)
         # Yaw-only inverse for the POSITION mapping: the operator holds the phone
@@ -1087,8 +966,6 @@ class BrowserPhone:
             target=_browser_phone_process_main,
             name="BrowserPhoneServerProcess",
             args=(
-                self.config,
-                self.port,
                 self._action_ipc_queue,
                 self._command_ipc_queue,
                 self._status_ipc_queue,
@@ -1102,7 +979,7 @@ class BrowserPhone:
             if self._server_process is not None and not self._server_process.is_alive():
                 self._stop_trajectory_writer_process()
                 raise RuntimeError(
-                    f"BrowserPhone server process exited early with "
+                    f"BrowserPhone network process exited early with "
                     f"code {self._server_process.exitcode}"
                 )
             try:
@@ -1115,14 +992,13 @@ class BrowserPhone:
                     self._command_ipc_queue,
                     self._trajectory_ipc_queue,
                 )
-                self._install_sighup_handler()
-                print(f"[browser_phone] server process pid={self._server_process.pid} ready")
+                print(f"[browser_phone] network process pid={self._server_process.pid} ready")
                 return
             if kind == "error":
                 self._stop_trajectory_writer_process()
-                raise RuntimeError(f"BrowserPhone server process failed: {payload}")
+                raise RuntimeError(f"BrowserPhone network process failed: {payload}")
         self._stop_trajectory_writer_process()
-        raise RuntimeError("BrowserPhone server process failed to start within startup window")
+        raise RuntimeError("BrowserPhone network process failed to start within startup window")
 
     def _trajectory_queue_max(self) -> int:
         raw = _os.environ.get("PHONE_ARM_TRAJECTORY_QUEUE_MAX", "0")
@@ -1196,24 +1072,6 @@ class BrowserPhone:
         self._trajectory_process = None
         self._trajectory_ipc_queue = None
         self._trajectory_status_queue = None
-
-    def _install_sighup_handler(self) -> None:
-        # Register SIGHUP -> reload tokens from the MAIN thread (the only place
-        # signal.signal works). mint_token.py signals the parent follower.main
-        # process, so we forward reloads to the child over IPC. Without this the
-        # default SIGHUP action would terminate teleop.
-        def _on_sighup(_signum, _frame):
-            if self._command_ipc_queue is not None:
-                try:
-                    self._command_ipc_queue.put_nowait(("reload_tokens", None))
-                except (_queue.Full, BrokenPipeError, EOFError, OSError):
-                    print("[browser_phone] token reload signal dropped; command queue unavailable")
-        try:
-            signal.signal(signal.SIGHUP, _on_sighup)
-        except (ValueError, OSError) as e:
-            # ValueError if connect() ever ends up on a non-main thread.
-            print(f"[browser_phone] could not install SIGHUP handler ({e}); "
-                  "token edits will require restart")
 
     def calibrate(self) -> None:
         # No-op; first B1 rising edge calibrates in place.
@@ -2140,7 +1998,7 @@ class BrowserPhone:
 
     async def _relay_wt_arm_loop(self) -> None:
         """Arm-side WebTransport datagram client for the session relay."""
-        url = _session_relay_wt_url("arm")
+        url = _session_relay_wt_url()
         if not url:
             return
         backoff_s = 0.5
@@ -2795,13 +2653,13 @@ class BrowserPhone:
         if self._server_process is not None:
             self._server_process.join(timeout=5.0)
             if self._server_process.is_alive():
-                print("[browser_phone] server process did not stop; terminating")
+                print("[browser_phone] network process did not stop; terminating")
                 self._server_process.terminate()
                 self._server_process.join(timeout=3.0)
             self._server_process = None
         self._stop_trajectory_writer_process()
 
-    # --- Internal: aiohttp server ---------------------------------------
+    # --- Internal network process ---------------------------------------
     def _run_server(self) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -2834,7 +2692,7 @@ class BrowserPhone:
             loop.run_until_complete(self._start_server())
             loop.run_forever()
         except Exception as e:  # noqa: BLE001
-            print(f"[browser_phone] server crashed: {e}")
+            print(f"[browser_phone] network process crashed: {e}")
             self._notify_process_status("error", repr(e))
             self._ready_event.set()
         finally:
@@ -2914,376 +2772,27 @@ class BrowserPhone:
                     rec.record_event(event_type, details)
             elif kind == "robot_feedback":
                 self._store_robot_feedback(payload)
-            elif kind == "reload_tokens":
-                if self._loop is not None and self._loop.is_running():
-                    self._loop.call_soon_threadsafe(self._load_tokens)
             elif kind == "shutdown":
                 if self._loop is not None and self._loop.is_running():
                     asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
                 return
 
-    # --- Token auth -----------------------------------------------------
-    def _load_tokens(self) -> None:
-        """Read TOKENS_FILE and refresh in-memory token list. Called at startup
-        and on SIGHUP. If the file is absent the server runs unauthenticated."""
-        if not TOKENS_FILE.exists():
-            self._tokens = []
-            self._auth_enabled = False
-            print(f"[browser_phone] auth DISABLED (no {TOKENS_FILE}) -- any "
-                  "connection is accepted; use follower/mint_token.py to lock it down")
-            return
-        try:
-            with open(TOKENS_FILE) as f:
-                data = json.load(f)
-            if not isinstance(data, list):
-                raise ValueError("tokens file is not a JSON array")
-        except Exception as e:  # noqa: BLE001
-            print(f"[browser_phone] failed to load {TOKENS_FILE}: {e} -- "
-                  "auth stays in current state")
-            return
-        self._tokens = data
-        self._auth_enabled = True
-        now = time.time()
-        active = sum(1 for t in data
-                     if t.get("expires_at") is None or t.get("expires_at") > now)
-        print(f"[browser_phone] auth ENABLED: {active}/{len(data)} tokens active")
-
-    def _token_name_for(self, token: str | None) -> str | None:
-        """Return the named identity for `token`, or None if invalid/expired."""
-        if not token:
-            return None
-        now = time.time()
-        for entry in self._tokens:
-            if entry.get("value") != token:
-                continue
-            exp = entry.get("expires_at")
-            if exp is not None and exp <= now:
-                return None
-            return entry.get("name") or "(unnamed)"
-        return None
-
-    # Paths that bypass token auth. The landing page and static assets must be
-    # reachable without a token so the client-side JS can run and read ?t=
-    # from the URL on first load. The interesting endpoints (/ws, /webrtc/*,
-    # /control/*, /stats) are still gated -- those are what actually grant
-    # control.
-    _AUTH_PUBLIC_PREFIXES = ("/healthz", "/static/", "/test_event")
-    _AUTH_PUBLIC_EXACT = {"/"}
-
-    @web.middleware
-    async def _auth_middleware(self, request: web.Request, handler):
-        if request.path in self._AUTH_PUBLIC_EXACT:
-            return await handler(request)
-        if any(request.path.startswith(p) for p in self._AUTH_PUBLIC_PREFIXES):
-            return await handler(request)
-        if not self._auth_enabled:
-            return await handler(request)
-        token = request.query.get("t")
-        name = self._token_name_for(token)
-        if name is None:
-            return web.Response(status=401, text="invalid or missing token\n")
-        return await handler(request)
-
     async def _start_server(self) -> None:
-        if HOSTED_API_URL:
-            print(
-                f"[browser_phone] hosted web API={HOSTED_API_URL}; "
-                "local HTTPS disabled"
-            )
-            print(
-                "[browser_phone] session relay (WT) enabled "
-                f"session={SESSION_RELAY_SESSION} url={SESSION_RELAY_WT_URL}"
-            )
-            asyncio.ensure_future(self._loop_lag_probe())
-            self._relay_task = asyncio.ensure_future(self._relay_wt_arm_loop())
-            self._relay_stats_task = asyncio.ensure_future(self._relay_stats_loop())
-            self._start_ipc_command_thread()
-            self._ready_event.set()
-            self._notify_process_status("ready", None)
-            return
-
-        cert, key = _ensure_cert()
-        ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        ssl_ctx.load_cert_chain(cert, key)
-
-        # Auth: load tokens at startup. The SIGHUP handler is registered from
-        # the MAIN thread (in connect()) because signal.signal / asyncio's
-        # add_signal_handler only work there; this method runs in the daemon
-        # server thread and can't register one of its own.
-        self._load_tokens()
-
-        app = web.Application(middlewares=[self._auth_middleware])
-        app.router.add_get("/", self._serve_index)
-        if not TURN_URL and not ALLOW_NO_TURN_FOR_LOCAL_REPRO:
+        if not SESSION_RELAY_WT_URL or not SESSION_RELAY_ARM_TOKEN:
             raise RuntimeError(
-                "WHEP video is relay-only but no TURN server is configured. "
-                "follower/run.sh supplies PHONE_ARM_TURN_URL/USER/PW from ~/.turn_secret."
+                "hosted session relay URL and arm capability are required; "
+                "start the follower with follower/run.sh"
             )
-        if ((not MEDIAMTX_WHEP_URL or not MEDIAMTX_PLAY_TOKEN)
-                and not ALLOW_NO_TURN_FOR_LOCAL_REPRO):
-            raise RuntimeError(
-                "WHEP video is enabled in the browser but MediaMTX config is missing. "
-                "follower/run.sh supplies PHONE_ARM_MEDIAMTX_WHEP_URL/PLAY_TOKEN."
-            )
-        app.router.add_get("/webrtc/config", self._webrtc_config)
-        app.router.add_get("/leader/config", self._leader_config)
-        app.router.add_post("/control/release", self._control_release)
-        print(f"[browser_phone] robot_video=WHEP(MediaMTX local fallback) "
-              f"device={VIDEO_DEVICE} "
-              f"cameras={[k for k, _l, _d in _present_cameras()]} "
-              f"turn={TURN_URL} control=relay-webtransport")
-        app.router.add_get("/healthz", lambda _r: web.Response(text="ok"))
-        app.router.add_get("/stats", self._serve_stats)
-        app.router.add_get("/sw.js", self._serve_service_worker)
-        app.router.add_get("/static/app.js", self._serve_app_js)
-        app.router.add_static("/static", STATIC_DIR, show_index=False)
-        app.router.add_post("/test_event", self._test_event_handler)
-
-        self._runner = web.AppRunner(app, access_log=None)
-        await self._runner.setup()
-        # Development fallback only. Production browser API traffic terminates
-        # on the VPS and never enters this listener.
-        self._site = web.TCPSite(self._runner, host="127.0.0.1", port=self.port,
-                                 ssl_context=ssl_ctx)
-        await self._site.start()
-        # One global asyncio-loop-lag probe; logs incidents only.
-        asyncio.ensure_future(self._loop_lag_probe())
-        # Arm-side WebTransport client -- the only control transport.
         print(
             "[browser_phone] session relay (WT) enabled "
             f"session={SESSION_RELAY_SESSION} url={SESSION_RELAY_WT_URL}"
         )
+        asyncio.ensure_future(self._loop_lag_probe())
         self._relay_task = asyncio.ensure_future(self._relay_wt_arm_loop())
         self._relay_stats_task = asyncio.ensure_future(self._relay_stats_loop())
         self._start_ipc_command_thread()
         self._ready_event.set()
         self._notify_process_status("ready", None)
-
-    async def _serve_stats(self, _request: web.Request) -> web.Response:
-        with self._state_lock:
-            last = dict(self._latest_msg) if self._latest_msg else None
-            n = self._n_msgs
-            owner = self._control_owner_page_id
-            owner_name = self._control_owner_name
-            owner_seen_age_ms = (
-                time.time() * 1000.0 - self._control_owner_seen_ms
-                if owner is not None and self._control_owner_seen_ms > 0
-                else None
-            )
-        out = {
-            "control_msgs_total": n,
-            "control_last_msg": last,
-            "robot_feedback": self._robot_feedback_snapshot(),
-            "control_owner": {
-                "page_id": owner,
-                "token_name": owner_name,
-                "seen_age_ms": (
-                    round(owner_seen_age_ms, 1)
-                    if owner_seen_age_ms is not None else None
-                ),
-                "timeout_s": CONTROL_OWNER_TIMEOUT_S,
-            },
-        }
-        return web.json_response(out)
-
-    async def _test_event_handler(self, request: web.Request) -> web.Response:
-        try:
-            payload = await request.json()
-        except Exception:
-            return web.json_response({"error": "bad json"}, status=400)
-        self._ensure_session_recorder(request.query.get("t"))
-        payload.setdefault("server_recv_ms", round(time.time() * 1000.0, 3))
-        payload.setdefault("http_user_agent", request.headers.get("User-Agent", ""))
-        payload.setdefault("http_remote", request.remote)
-        payload.setdefault("http_x_forwarded_for", request.headers.get("X-Forwarded-For", ""))
-        kind = str(payload.get("kind", "browser_event"))
-        _record_session_event(f"browser_{kind}", payload)
-        if kind in {"pose_source_stats", "control_debug"}:
-            self._record_browser_debug_payload(payload)
-        return web.json_response({"ok": True})
-
-    # --- Robot camera video ---------------------------------------------
-    def _ice_servers_json(self) -> list[dict]:
-        # The local development server retains its older static TURN setup.
-        # Hosted production configuration is issued by server/api.py instead.
-        if not TURN_URLS_PHONE:
-            return []
-        return [{"urls": TURN_URLS_PHONE, "username": TURN_USER, "credential": TURN_PW}]
-
-    @staticmethod
-    def _truthy_query(value: str | None) -> bool:
-        return str(value or "").strip().lower() in {"1", "true", "yes", "on", "controller"}
-
-    @staticmethod
-    def _request_page_id(request: web.Request) -> str | None:
-        raw = (
-            request.query.get("page_id")
-            or request.query.get("app_page_id")
-            or request.headers.get("X-Phone-Arm-Page-Id")
-            or ""
-        )
-        page_id = str(raw).strip()
-        if not page_id:
-            return None
-        return page_id[:80]
-
-    def _control_owner_expired_locked(self, now_ms: float) -> bool:
-        return (
-            self._control_owner_page_id is not None
-            and now_ms - self._control_owner_seen_ms
-            > CONTROL_OWNER_TIMEOUT_S * 1000.0
-        )
-
-    def _note_control_owner_seen(self, page_id: str | None) -> None:
-        if not page_id:
-            return
-        now_ms = time.time() * 1000.0
-        with self._state_lock:
-            if self._control_owner_page_id == page_id:
-                self._control_owner_seen_ms = now_ms
-
-    def _claim_control_owner(self, request: web.Request) -> tuple[bool, dict]:
-        now_ms = time.time() * 1000.0
-        page_id = self._request_page_id(request)
-        token_name = (
-            self._token_name_for(request.query.get("t"))
-            if self._auth_enabled
-            else "no_auth"
-        )
-        if not page_id:
-            return False, {
-                "controlRole": "viewer",
-                "controlDeniedReason": "missing_page_id",
-            }
-        with self._state_lock:
-            if self._control_owner_expired_locked(now_ms):
-                expired_page = self._control_owner_page_id
-                self._control_owner_page_id = None
-                self._control_owner_name = None
-                self._control_owner_claim_ms = 0.0
-                self._control_owner_seen_ms = 0.0
-                _record_session_event("control_owner_expired", {
-                    "page_id": expired_page,
-                    "timeout_s": CONTROL_OWNER_TIMEOUT_S,
-                })
-            if (
-                self._control_owner_page_id is None
-                or self._control_owner_page_id == page_id
-            ):
-                fresh_claim = self._control_owner_page_id is None
-                self._control_owner_page_id = page_id
-                self._control_owner_name = token_name
-                if fresh_claim:
-                    self._control_owner_claim_ms = now_ms
-                self._control_owner_seen_ms = now_ms
-                owner_age_ms = now_ms - self._control_owner_claim_ms
-                if fresh_claim:
-                    _record_session_event("control_owner_claimed", {
-                        "page_id": page_id,
-                        "token_name": token_name,
-                    })
-                return True, {
-                    "controlRole": "controller",
-                    "controlOwnerPageId": page_id,
-                    "controlOwnerAgeMs": round(owner_age_ms, 1),
-                    "controlOwnerTimeoutS": CONTROL_OWNER_TIMEOUT_S,
-                }
-            owner_age_ms = now_ms - self._control_owner_claim_ms
-            owner_seen_age_ms = now_ms - self._control_owner_seen_ms
-            details = {
-                "controlRole": "viewer",
-                "controlDeniedReason": "controller_active",
-                "controlOwnerPageId": self._control_owner_page_id,
-                "controlOwnerAgeMs": round(owner_age_ms, 1),
-                "controlOwnerSeenAgeMs": round(owner_seen_age_ms, 1),
-                "controlOwnerTimeoutS": CONTROL_OWNER_TIMEOUT_S,
-            }
-            _record_session_event("control_owner_denied", {
-                "page_id": page_id,
-                "token_name": token_name,
-                **details,
-            })
-            return False, details
-
-    async def _webrtc_config(self, request: web.Request) -> web.Response:
-        wants_control = self._truthy_query(request.query.get("want_control"))
-        wants_video = not (
-            request.query.get("want_video", "1").strip().lower()
-            in {"0", "false", "no", "off"}
-        )
-        cfg = {
-            "iceServers": self._ice_servers_json() if wants_video else [],
-            "iceTransportPolicy": "relay",
-            "controlRole": "viewer",
-            "controlTransport": "viewer",
-        }
-        if wants_control:
-            granted, claim = self._claim_control_owner(request)
-            cfg.update(claim)
-            if granted:
-                cfg["controlTransport"] = "relay-webtransport"
-                cfg["sessionRelayWtUrl"] = _session_relay_wt_url("phone")
-                cfg["sessionRelaySession"] = SESSION_RELAY_SESSION
-        if wants_video and MEDIAMTX_WHEP_URL and MEDIAMTX_PLAY_TOKEN:
-            cfg["mediamtxWhepUrl"] = MEDIAMTX_WHEP_URL
-            cfg["mediamtxPlayToken"] = MEDIAMTX_PLAY_TOKEN
-        return web.json_response(cfg, headers={"Cache-Control": "no-store"})
-
-    async def _leader_config(self, _request: web.Request) -> web.Response:
-        """Return the one-to-one source command for the current relay session.
-
-        This endpoint is token protected by the normal middleware. The command
-        consequently contains the phone-role relay credential and must not be
-        logged or exposed from a public, unauthenticated page.
-        """
-        # A physical leader beside the robot should use the canonical relay
-        # directly, rather than the geographically remote phone forwarder.
-        relay_url = _session_relay_wt_url(
-            "phone", base_override=SESSION_RELAY_WT_URL
-        )
-        command = (
-            "cd ~/dev/phone_arm && ./controllers/leader_arm/run.sh --url "
-            + shlex.quote(relay_url)
-        )
-        return web.json_response(
-            {
-                "mode": "one_to_one",
-                "session": SESSION_RELAY_SESSION,
-                "command": command,
-            },
-            headers={"Cache-Control": "no-store"},
-        )
-
-    async def _control_release(self, request: web.Request) -> web.Response:
-        page_id = self._request_page_id(request)
-        if page_id is None:
-            try:
-                payload = await request.json()
-            except Exception:
-                payload = {}
-            page_id = str(payload.get("page_id") or payload.get("app_page_id") or "").strip()[:80]
-        released = False
-        with self._state_lock:
-            if page_id and self._control_owner_page_id == page_id:
-                released = True
-                self._control_owner_page_id = None
-                self._control_owner_name = None
-                self._control_owner_claim_ms = 0.0
-                self._control_owner_seen_ms = 0.0
-        if released:
-            _record_session_event("control_owner_released", {"page_id": page_id})
-        return web.json_response({"ok": True, "released": released})
-
-
-    def _ensure_session_recorder(self, token: str | None) -> None:
-        """Lazy-open the per-session recorder on first authenticated activity.
-        Once-per-process: subsequent calls (e.g. browser reconnects from the same
-        operator) are no-ops, so a flaky link doesn't fragment the recording.
-        To start a new session, restart teleop."""
-        name = self._token_name_for(token) if self._auth_enabled else "no_auth"
-        if name is None:
-            name = "unknown"
-        self._ensure_session_recorder_name(name)
 
     def _ensure_session_recorder_name(self, name: str) -> None:
         global _ACTIVE_RECORDER
@@ -3316,168 +2825,7 @@ class BrowserPhone:
             except Exception as e:  # noqa: BLE001
                 print(f"[recorder] close failed: {e}")
             self._session_recorder = None
-        if self._site is not None:
-            await self._site.stop()
-        if self._runner is not None:
-            await self._runner.cleanup()
         self._loop.stop()
-
-    async def _serve_index(self, _request: web.Request) -> web.Response:
-        return web.FileResponse(STATIC_DIR / "index.html", headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        })
-
-    async def _serve_app_js(self, _request: web.Request) -> web.Response:
-        return web.FileResponse(STATIC_DIR / "app.js", headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        })
-
-    async def _serve_service_worker(self, _request: web.Request) -> web.Response:
-        return web.FileResponse(STATIC_DIR / "sw.js", headers={
-            "Service-Worker-Allowed": "/",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-        })
-
-    def _record_browser_debug_payload(self, data: dict) -> None:
-        """Record one best-effort browser debug payload.
-
-        Debug payloads arrive over the non-control HTTP /test_event path, so
-        they are excluded from pose sequence/order checks and from the motion
-        gate. They are joined post-run by page_id + last_pose_seq.
-        """
-        t_recv_ms = time.time() * 1000.0
-        self._note_control_owner_seen(
-            data.get("page_id") or data.get("app_page_id")
-        )
-        for src, dst in (
-            ("ctrl_state", "ctrl_state"),
-            ("ctrl_ready", "ctrl_ready"),
-            ("ctrl_conn_seq", "ctrl_conn_seq"),
-            ("ctrl_connect_seq", "ctrl_conn_seq"),
-            ("ctrl_reconnect_count", "ctrl_reconnect_count"),
-            ("ctrl_last_reconnect_reason", "ctrl_last_reconnect_reason"),
-        ):
-            if src in data:
-                self._dc_last_client_ctrl[dst] = data.get(src)
-
-        t_browser_debug_ms = data.get("t", data.get("t_browser_ms"))
-        source_age_data = dict(data)
-        if "t" not in source_age_data and t_browser_debug_ms is not None:
-            source_age_data["t"] = t_browser_debug_ms
-        source_age_ms = self._source_age_ms(source_age_data, t_recv_ms)
-        relay_recv_ms = self._finite_float(data.get("_relay_recv_ms"))
-        relay_send_ms = self._finite_float(data.get("_relay_send_ms"))
-        relay_queue_ms = self._finite_float(data.get("_relay_queue_age_ms"))
-        if relay_queue_ms is None and relay_recv_ms is not None and relay_send_ms is not None:
-            relay_queue_ms = max(0.0, relay_send_ms - relay_recv_ms)
-        relay_to_pi_ms = (
-            t_recv_ms - relay_send_ms
-            if relay_send_ms is not None
-            else None
-        )
-        edge_send_ms = self._finite_float(data.get("_edge_send_ms"))
-        edge_to_relay_ms = (
-            relay_recv_ms - edge_send_ms
-            if relay_recv_ms is not None and edge_send_ms is not None
-            else self._finite_float(data.get("_edge_to_relay_ms"))
-        )
-        t_client_ms = self._finite_float(t_browser_debug_ms)
-        t_browser_write_ms = self._finite_float(data.get("t_browser_write_ms"))
-        browser_queue_ms = (
-            t_browser_write_ms - t_client_ms
-            if t_client_ms is not None and t_browser_write_ms is not None
-            else self._finite_float(data.get("_browser_queue_ms"))
-        )
-        phone_to_relay_ms = None
-        if bool(data.get("off_valid", False)):
-            clock_offset_ms = self._finite_float(data.get("off"))
-            if (
-                t_client_ms is not None
-                and clock_offset_ms is not None
-                and relay_recv_ms is not None
-            ):
-                phone_to_relay_ms = relay_recv_ms - (t_client_ms + clock_offset_ms)
-
-        row = {
-            "type": data.get("type") or data.get("kind"),
-            "app_v": data.get("app_v") or data.get("app_schema_id"),
-            "page_id": data.get("page_id") or data.get("app_page_id"),
-            "last_pose_seq": data.get("last_pose_seq", data.get("lastPoseSeqSent")),
-            "last_pose_t_browser_ms": data.get(
-                "last_pose_t_browser_ms",
-                data.get("lastPoseTBrowserMs"),
-            ),
-            "last_pose_sent_age_ms": data.get("last_pose_sent_age_ms"),
-            "t_browser_debug_ms": t_browser_debug_ms,
-            "t_browser_write_ms": data.get("t_browser_write_ms"),
-            "t_pi_recv_ms": round(t_recv_ms, 3),
-            "clock_offset_ms": data.get("off"),
-            "clock_offset_valid": int(bool(data.get("off_valid", False))),
-            "source_age_ms": round(source_age_ms, 3) if source_age_ms is not None else None,
-            "ctrl_ack_age_ms": data.get("ctrl_ack_age_ms"),
-            "ctrl_edge_ack_age_ms": data.get("ctrl_edge_ack_age_ms"),
-            "ctrl_robot_ack_age_ms": data.get("ctrl_robot_ack_age_ms"),
-            "ctrl_edge_rtt_ms": data.get("ctrl_edge_rtt_ms"),
-            "ctrl_robot_rtt_ms": data.get("ctrl_robot_rtt_ms"),
-            "ctrl_state": data.get("ctrl_state"),
-            "ctrl_ready": data.get("ctrl_ready"),
-            "ctrl_conn_seq": data.get("ctrl_conn_seq", data.get("ctrl_connect_seq")),
-            "ctrl_reconnect_count": data.get("ctrl_reconnect_count"),
-            "ctrl_last_reconnect_reason": data.get("ctrl_last_reconnect_reason"),
-            "video_state": data.get("video_state"),
-            "video_error": data.get("video_error"),
-            "video_reconnect_count": data.get("video_reconnect_count"),
-            "video_last_reconnect_reason": data.get("video_last_reconnect_reason"),
-            "robot_tracking_error_m": data.get("robot_tracking_error_m"),
-            "robot_tracking_command_error_m": data.get("robot_tracking_command_error_m"),
-            "robot_tracking_goal_error_m": data.get("robot_tracking_goal_error_m"),
-            "robot_tracking_age_ms": data.get("robot_tracking_age_ms"),
-            "robot_tracking_seq": data.get("robot_tracking_seq"),
-            "robot_tracking_phone_enabled": data.get("robot_tracking_phone_enabled"),
-            "wrtc_rtt_ms": data.get("wrtc_rtt_ms", data.get("wrtc_rtt")),
-            "wrtc_jbuf_ms": data.get("wrtc_jbuf_ms", data.get("wrtc_jbuf")),
-            "wrtc_decode_ms": data.get("wrtc_decode_ms", data.get("wrtc_decode")),
-            "wrtc_jitter_ms": data.get("wrtc_jitter_ms", data.get("wrtc_jitter")),
-            "wrtc_fps": data.get("wrtc_fps"),
-            "wrtc_freezes": data.get("wrtc_freezes"),
-            "wrtc_via": data.get("wrtc_via"),
-            "wrtc_decoder_impl": data.get("wrtc_decoder_impl"),
-            "wrtc_power_efficient": data.get("wrtc_power_efficient"),
-            "wrtc_packets_lost": data.get("wrtc_packets_lost"),
-            "wrtc_packets_received": data.get("wrtc_packets_received"),
-            "wt_write_attempts": data.get("wt_write_attempts", data.get("wtWriteAttempts")),
-            "wt_writer_blocked_count": data.get(
-                "wt_writer_blocked_count",
-                data.get("wtWriterBlockedCount"),
-            ),
-            "wt_writer_blocked_ms": data.get(
-                "wt_writer_blocked_ms",
-                data.get("wtWriterBlockedMs"),
-            ),
-            "debug_post": data.get("debugPost"),
-            "debug_post_fail": data.get("debugPostFail"),
-            "relay_epoch": data.get("_relay_epoch"),
-            "browser_queue_ms": browser_queue_ms,
-            "browser_write_to_edge_ms": data.get("_browser_write_to_edge_ms"),
-            "browser_write_to_relay_ms": data.get("_browser_write_to_relay_ms"),
-            "edge_recv_ms": data.get("_edge_recv_ms"),
-            "edge_send_ms": data.get("_edge_send_ms"),
-            "edge_queue_ms": data.get("_edge_q_ms"),
-            "edge_to_relay_ms": edge_to_relay_ms,
-            "relay_recv_ms": data.get("_relay_recv_ms"),
-            "relay_send_ms": data.get("_relay_send_ms"),
-            "relay_queue_age_ms": relay_queue_ms,
-            "phone_to_relay_ms": phone_to_relay_ms,
-            "relay_to_pi_ms": relay_to_pi_ms,
-        }
-        rec = self._session_recorder
-        if rec is not None:
-            rec.record_debug(row)
-        self._maybe_log_webrtc_stats(data, time.time())
 
     def _ingest_pose_msg(self, data: dict, *, is_active: bool = True) -> dict | None:
         """Process one WebTransport pose datagram.
@@ -3491,9 +2839,6 @@ class BrowserPhone:
         if not is_active:
             return None
         t_recv_ms = time.time() * 1000.0
-        self._note_control_owner_seen(
-            data.get("page_id") or data.get("app_page_id")
-        )
         # WT arrival pattern: track inter-arrival gaps so the periodic stats
         # snapshot can report bursts (sub-ms = kernel buffer flush after the
         # asyncio loop was busy) vs steady delivery.
@@ -3653,28 +2998,17 @@ class BrowserPhone:
         return None
 
 def _browser_phone_process_main(
-    config: PhoneConfig,
-    port: int,
     action_queue,
     command_queue,
     status_queue,
     trajectory_queue=None,
 ) -> None:
-    """Child-process entry point for the browser/control server."""
-    server = BrowserPhone(config, port=port)
+    """Child-process entry point for the arm-side relay client."""
+    server = BrowserPhone()
     server._action_ipc_queue = action_queue
     server._command_ipc_queue = command_queue
     server._status_ipc_queue = status_queue
     server._trajectory_ipc_queue = trajectory_queue
-
-    def _on_sighup(_signum, _frame):
-        if server._loop is not None and server._loop.is_running():
-            server._loop.call_soon_threadsafe(server._load_tokens)
-
-    try:
-        signal.signal(signal.SIGHUP, _on_sighup)
-    except (ValueError, OSError):
-        pass
 
     try:
         server._run_server()

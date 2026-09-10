@@ -42,7 +42,7 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 import follower.gateway as _browser_phone_mod  # for access to _ACTIVE_RECORDER
 from follower.hardware import select_follower_arm
-from follower.gateway import BrowserPhone, PhoneConfig
+from follower.gateway import BrowserPhone
 from follower.leader_mapping import RelativeLeaderMapper
 
 
@@ -2023,7 +2023,7 @@ def main() -> None:
     port, robot_id = select_follower_arm()
     print(f"[config] port={port} calibration={robot_id} max_cmd_dps={MAX_CMD_DEG_PER_SEC:g}")
     robot = SafeStartupSO101Follower(SO101FollowerConfig(port=port, id=robot_id, use_degrees=True))
-    teleop = BrowserPhone(PhoneConfig())
+    teleop = BrowserPhone()
 
     # Connect robot BEFORE teleop so startup owns the serial bus exclusively.
     # The helper retries only the fragile motor-discovery reads and guarantees
