@@ -1,11 +1,10 @@
 """Discover and select the physical SO101 follower arm."""
 from __future__ import annotations
 
-import glob
-import os
-import subprocess
 import sys
 from pathlib import Path
+
+from shared.usb_arm import discover_ports, port_in_use, serial_from_port
 
 
 CALIBRATION_DIR = (
@@ -18,49 +17,6 @@ CALIBRATION_DIR = (
 CALIBRATION_SERIAL_ALIASES = {
     "5B14029128": "5AE6084208",
 }
-
-
-def serial_from_port(port: str) -> str:
-    name = Path(port).name
-    marker = "_Serial_"
-    if marker in name:
-        return name.split(marker, 1)[1].split("-if", 1)[0]
-    try:
-        out = subprocess.check_output(
-            ["udevadm", "info", "-q", "property", "-n", port],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return name
-    for line in out.splitlines():
-        if line.startswith("ID_SERIAL_SHORT="):
-            return line.split("=", 1)[1]
-    return name
-
-
-def discover_ports() -> list[str]:
-    ports = sorted(glob.glob("/dev/serial/by-id/usb-1a86_USB_Single_Serial_*-if00"))
-    if not ports:
-        ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
-    return ports
-
-
-def port_in_use(port: str) -> bool:
-    """Best-effort protection against selecting an arm owned by another process."""
-    target = os.path.realpath(port)
-    for proc_fd_dir in Path("/proc").glob("[0-9]*/fd"):
-        try:
-            fds = list(proc_fd_dir.iterdir())
-        except OSError:
-            continue
-        for fd in fds:
-            try:
-                if os.path.realpath(fd) == target:
-                    return True
-            except OSError:
-                continue
-    return False
 
 
 def calibration_id_for_port(port: str) -> str:

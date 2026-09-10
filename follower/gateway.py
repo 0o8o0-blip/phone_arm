@@ -17,14 +17,14 @@ BrowserPhone.connect():
   1. BrowserPhone network subprocess (_browser_phone_process_main)
      - is the arm-side WebTransport client -- pose datagrams flow relay
        -> here -> _ingest_pose_msg -> IPC to main
-     - owns SessionRecorder for pose.csv + debug.csv + events.jsonl
+     - owns SessionRecorder for pose.csv + events.jsonl
 
   2. Trajectory writer subprocess (_trajectory_writer_process_main)
      - takes IK-tick trajectory rows over an mp.Queue, appends to
        trajectory.csv. Isolated because trajectory rows come in at 60 Hz
        and the CSV I/O would otherwise stall the IK loop under disk pressure.
 
-_RecorderProxy wires the IPC between them so pose.csv, debug.csv, events.jsonl,
+_RecorderProxy wires the IPC between them so pose.csv, events.jsonl,
 and trajectory.csv land under the same session directory. `follower/run.sh`
 supplies that directory.
 
@@ -132,7 +132,6 @@ class SessionRecorder:
     """Per-session recorder. Writes:
       <session-dir>/
         pose.csv          -- one row per accepted B1-held control pose
-        debug.csv         -- browser/control diagnostics keyed by last pose seq
         events.jsonl      -- B1 transitions, faults, re-cals
 
     follower/run.sh sets <session-dir> once per run. Direct follower.main runs fall back to
@@ -158,18 +157,7 @@ class SessionRecorder:
         self._pose_csv = (self.session_dir / "pose.csv").open("w", buffering=1)
         self._pose_csv_header_written = False
         self._pose_columns: tuple[str, ...] | None = None
-        self._debug_csv = None
-        self._debug_csv_header_written = False
-        self._debug_columns: tuple[str, ...] | None = None
         self._events_jsonl = (self.session_dir / "events.jsonl").open("w", buffering=1)
-        # trajectory.csv: per-IK-tick desired_ee + q_meas + q_goal. Opened
-        # lazily on first record_trajectory call so a session that never
-        # touches the arm doesn't leave a stub file. Join to pose.csv via
-        # nearest t_pi_ms; IK runs at 60Hz vs pose ~30Hz so multiple
-        # trajectory rows can map to one pose.
-        self._trajectory_csv = None
-        self._trajectory_csv_header_written = False
-        self._trajectory_columns: tuple[str, ...] | None = None
         self._closed = False
         self._close_reported = False
         self._drop_counts: dict[str, int] = {}
@@ -191,17 +179,6 @@ class SessionRecorder:
         """One row per accepted pose. Caller decides which rows to log (e.g.
         B1-held only); the recorder just writes whatever it's given."""
         self._enqueue("pose", dict(row))
-
-    def record_debug(self, row: dict) -> None:
-        """One row per best-effort browser debug datagram."""
-        self._enqueue("debug", dict(row))
-
-    def record_trajectory(self, row: dict) -> None:
-        """One row per IK tick while robot motion is being commanded or settling.
-        Called from follower.main's _TrajectoryLogger. Caller decides the
-        key set; the recorder writes whatever it's given. Schema is opened
-        lazily from the first row's keys."""
-        self._enqueue("trajectory", dict(row))
 
     def record_event(self, event_type: str, details: dict | None = None) -> None:
         rec = {
@@ -243,10 +220,6 @@ class SessionRecorder:
                         break
                     if kind == "pose":
                         self._write_pose(payload)
-                    elif kind == "debug":
-                        self._write_debug(payload)
-                    elif kind == "trajectory":
-                        self._write_trajectory(payload)
                     elif kind == "event":
                         self._write_event(payload)
                     else:
@@ -269,28 +242,6 @@ class SessionRecorder:
         assert self._pose_columns is not None
         self._pose_csv.write(self._csv_row(row, self._pose_columns))
 
-    def _write_debug(self, row: dict) -> None:
-        if self._debug_csv is None:
-            self._debug_csv = (self.session_dir / "debug.csv").open("w", buffering=1)
-        if not self._debug_csv_header_written:
-            self._debug_columns = tuple(row.keys())
-            self._debug_csv.write(",".join(self._debug_columns) + "\n")
-            self._debug_csv_header_written = True
-        assert self._debug_columns is not None
-        self._debug_csv.write(self._csv_row(row, self._debug_columns))
-
-    def _write_trajectory(self, row: dict) -> None:
-        if self._trajectory_csv is None:
-            self._trajectory_csv = (
-                self.session_dir / "trajectory.csv"
-            ).open("w", buffering=1)
-        if not self._trajectory_csv_header_written:
-            self._trajectory_columns = tuple(row.keys())
-            self._trajectory_csv.write(",".join(self._trajectory_columns) + "\n")
-            self._trajectory_csv_header_written = True
-        assert self._trajectory_columns is not None
-        self._trajectory_csv.write(self._csv_row(row, self._trajectory_columns))
-
     def _write_event(self, rec: dict) -> None:
         self._events_jsonl.write(json.dumps(rec) + "\n")
 
@@ -305,9 +256,7 @@ class SessionRecorder:
         return out.getvalue()
 
     def _finalize_outputs(self) -> None:
-        for fh in (self._pose_csv, self._debug_csv, self._events_jsonl, self._trajectory_csv):
-            if fh is None:
-                continue
+        for fh in (self._pose_csv, self._events_jsonl):
             try:
                 fh.close()
             except Exception:
@@ -350,13 +299,13 @@ class SessionRecorder:
                 f"{kind}:{count}" for kind, count in sorted(drops.items())
             )
         print(f"[recorder] session closed: {self.session_dir} "
-              f"(pose/debug/events{drop_note})")
+              f"(pose/events{drop_note})")
 
 
 class _TrajectorySessionRecorder:
     """Dedicated-process writer for trajectory.csv.
 
-    This owns only trajectory.csv.  Pose/debug/events stay with SessionRecorder and
+    This owns only trajectory.csv. Pose/events stay with SessionRecorder and
     video stays with the video worker, so a large trajectory file cannot fill
     the network process's recorder queue.
     """
@@ -401,7 +350,7 @@ class _RecorderProxy:
     competes with high-volume CSV output.
     """
 
-    def __init__(self, command_queue, trajectory_queue=None) -> None:
+    def __init__(self, command_queue, trajectory_queue) -> None:
         self._command_queue = command_queue
         self._trajectory_queue = trajectory_queue
         self._drop_counts: dict[str, int] = {}
@@ -416,14 +365,13 @@ class _RecorderProxy:
             "PHONE_ARM_TRAJECTORY_BATCH_INTERVAL_S", 0.05, minimum=0.001
         )
         self._trajectory_thread: _threading.Thread | None = None
-        if self._trajectory_queue is not None:
-            self._trajectory_thread = _threading.Thread(
-                target=self._trajectory_feeder_loop,
-                name="TrajectoryRecorderProxy",
-                daemon=True,
-            )
-            self._trajectory_thread.start()
-            atexit.register(self.close)
+        self._trajectory_thread = _threading.Thread(
+            target=self._trajectory_feeder_loop,
+            name="TrajectoryRecorderProxy",
+            daemon=True,
+        )
+        self._trajectory_thread.start()
+        atexit.register(self.close)
 
     @staticmethod
     def _env_int(name: str, default: int, *, minimum: int) -> int:
@@ -460,10 +408,6 @@ class _RecorderProxy:
 
     def record_trajectory(self, row: dict) -> None:
         payload = dict(row)
-        q = self._trajectory_queue
-        if q is None:
-            self._send("trajectory", payload)
-            return
         with self._trajectory_lock:
             if self._trajectory_closed:
                 return
@@ -484,10 +428,6 @@ class _RecorderProxy:
         if not batch:
             return
         q = self._trajectory_queue
-        if q is None:
-            for row in batch:
-                self._send("trajectory", row)
-            return
         msg = ("trajectory", batch[0]) if len(batch) == 1 else ("trajectory_batch", batch)
         try:
             q.put_nowait(msg)
@@ -514,8 +454,6 @@ class _RecorderProxy:
                     return
 
     def close(self) -> None:
-        if self._trajectory_queue is None:
-            return
         with self._trajectory_lock:
             if self._trajectory_closed:
                 return
@@ -612,38 +550,6 @@ def check_if_already_connected(fn):
         return fn(self, *args, **kwargs)
 
     return wrapper
-
-# Pinned by by-PATH (physical USB port), NOT by-id: the generic Realtek 0bda:5844
-# cams all report the SAME fake serial (200901010001), so their by-id symlink
-# collides when two are plugged and flips unpredictably. by-path is unambiguous
-# and stable -- as long as each cam stays in its current port. The shell video
-# `follower/run.sh` uses this registry to select the ffmpeg input.
-_REALFLEX_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.0-usb-0:1.4:1.0-video-index0"   # port 1.4
-_CAM2_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.1.2:1.0-video-index0"     # port 1.1.2 (added 2026-05-28)
-_CAM3_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.1.4:1.0-video-index0"     # port 1.1.4 (added 2026-05-29)
-_C920_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.3:1.0-video-index0"       # port 1.3
-
-_CAMERA_REGISTRY: list[tuple[str, str, str]] = [
-    ("realflex", "RealFlex", _REALFLEX_DEVICE),
-    ("cam2", "Cam 2", _CAM2_DEVICE),
-    ("cam3", "Cam 3", _CAM3_DEVICE),
-    ("c920", "C920", _C920_DEVICE),
-]
-
-
-def _present_cameras() -> list[tuple[str, str, str]]:
-    cameras = [c for c in _CAMERA_REGISTRY if Path(c[2]).exists()]
-    known_targets = {str(Path(path).resolve()) for _key, _label, path in cameras}
-    by_path = Path("/dev/v4l/by-path")
-    if by_path.is_dir():
-        for device in sorted(by_path.glob("*-video-index0")):
-            target = str(device.resolve())
-            if target in known_targets:
-                continue
-            cameras.append((device.stem, device.name, str(device)))
-            known_targets.add(target)
-    return cameras
-
 
 # Session-relay WebTransport control transport.
 # The arm connects OUTBOUND as an "arm" peer. The hosted API independently
@@ -2752,20 +2658,7 @@ class BrowserPhone:
                 continue
             kind = item[0]
             payload = item[1] if len(item) > 1 else None
-            if kind == "trajectory":
-                tq = self._trajectory_ipc_queue
-                if tq is not None:
-                    try:
-                        tq.put_nowait(("trajectory", payload))
-                    except _queue.Full:
-                        tq.put(("trajectory", payload))
-                    except (BrokenPipeError, EOFError, OSError):
-                        pass
-                else:
-                    rec = self._session_recorder
-                    if rec is not None:
-                        rec.record_trajectory(payload)
-            elif kind == "event":
+            if kind == "event":
                 rec = self._session_recorder
                 if rec is not None:
                     event_type, details = payload

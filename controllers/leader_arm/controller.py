@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import glob
 import json
 import os
 import sys
@@ -13,43 +12,12 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from shared.leader_protocol import LEADER_JOINTS, LEADER_MESSAGE_TYPE
+from shared.usb_arm import discover_ports, port_in_use, serial_from_port
 
 
 DEFAULT_CALIBRATION_DIR = (
     Path.home() / ".cache/huggingface/lerobot/calibration/robots/so_follower"
 )
-
-
-def _serial_from_port(port: str) -> str:
-    name = Path(port).name
-    marker = "_Serial_"
-    if marker in name:
-        return name.split(marker, 1)[1].split("-if", 1)[0]
-    return name
-
-
-def discover_ports() -> list[str]:
-    ports = sorted(glob.glob("/dev/serial/by-id/usb-1a86_USB_Single_Serial_*-if00"))
-    if not ports:
-        ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
-    return ports
-
-
-def port_in_use(port: str) -> bool:
-    """Best-effort check that prevents selecting the running destination arm."""
-    target = os.path.realpath(port)
-    for proc_fd_dir in Path("/proc").glob("[0-9]*/fd"):
-        try:
-            fds = list(proc_fd_dir.iterdir())
-        except OSError:
-            continue
-        for fd in fds:
-            try:
-                if os.path.realpath(fd) == target:
-                    return True
-            except OSError:
-                continue
-    return False
 
 
 def choose_port(requested: str | None) -> str:
@@ -65,7 +33,7 @@ def choose_port(requested: str | None) -> str:
     busy = [port for port in detected if port_in_use(port)]
     ports = [port for port in detected if port not in busy]
     for port in busy:
-        print(f"Ignoring arm already in use: {_serial_from_port(port)} ({port})")
+        print(f"Ignoring arm already in use: {serial_from_port(port)} ({port})")
     if not ports:
         raise SystemExit("no SO101 USB serial adapters found")
     if not sys.stdin.isatty():
@@ -75,7 +43,7 @@ def choose_port(requested: str | None) -> str:
         raise SystemExit(f"multiple arms detected; pass --port with one of:\n{choices}")
     print("Pick the arm to use as the leader:")
     for i, port in enumerate(ports, 1):
-        print(f"  {i}. {_serial_from_port(port)}  ({port})")
+        print(f"  {i}. {serial_from_port(port)}  ({port})")
     while True:
         try:
             choice = int(input("Leader arm number: ").strip())
@@ -87,7 +55,7 @@ def choose_port(requested: str | None) -> str:
 
 
 def calibration_id_for(port: str, requested: str | None) -> str:
-    return requested or f"soarm_{_serial_from_port(port)}"
+    return requested or f"soarm_{serial_from_port(port)}"
 
 
 def redact_url(url: str) -> str:
@@ -171,7 +139,7 @@ async def send_loop(args, leader) -> None:
         from shared.webtransport import connect_webtransport_datagrams
 
     period = 1.0 / args.hz
-    source_id = f"leader-{_serial_from_port(args.port)}-{time.time_ns()}"
+    source_id = f"leader-{serial_from_port(args.port)}-{time.time_ns()}"
     seq = 0
     print(f"Connecting to {redact_url(args.url)}")
     async with connect_webtransport_datagrams(args.url, verify_tls=not args.insecure_tls) as wt:

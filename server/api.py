@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -110,20 +112,57 @@ class SessionApi:
             and current < float(follower["expires_at"])
         )
 
+    def _prune_expired(self, now: float | None = None) -> None:
+        """Drop session state only after explicit expiry, not disconnection."""
+        current = time.time() if now is None else now
+        expired_sessions = {
+            session
+            for session, follower in self.followers.items()
+            if float(follower.get("expires_at") or 0) <= current
+        }
+        for session in expired_sessions:
+            self.followers.pop(session, None)
+            self.owners.pop(session, None)
+
+        old_token_count = len(self.tokens)
+        self.tokens = [
+            entry
+            for entry in self.tokens
+            if float(entry.get("expires_at") or 0) > current
+        ]
+        if len(self.tokens) != old_token_count:
+            self._save_tokens()
+
+        cutoff = current - 3600
+        self.creates_by_address = {
+            address: recent
+            for address, stamps in self.creates_by_address.items()
+            if (recent := [stamp for stamp in stamps if stamp > cutoff])
+        }
+
     def _remote_address(self, request: web.Request) -> str:
-        forwarded = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
-        return forwarded or request.remote or "unknown"
+        remote = request.remote or "unknown"
+        try:
+            trusted_proxy = ipaddress.ip_address(remote).is_loopback
+        except ValueError:
+            trusted_proxy = False
+        if trusted_proxy:
+            forwarded = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+            if forwarded:
+                return forwarded
+        return remote
 
     def _check_create_rate(self, request: web.Request) -> None:
         now = time.time()
+        self._prune_expired(now)
         address = self._remote_address(request)
-        recent = [stamp for stamp in self.creates_by_address.get(address, []) if now - stamp < 3600]
+        recent = self.creates_by_address.get(address, [])
         if len(recent) >= CREATE_LIMIT_PER_HOUR:
             raise web.HTTPTooManyRequests(text="robot creation rate limit reached\n")
-        recent.append(now)
-        self.creates_by_address[address] = recent
         if sum(self._active(item, now) for item in self.followers.values()) >= MAX_ACTIVE_FOLLOWERS:
             raise web.HTTPServiceUnavailable(text="robot capacity reached\n")
+        recent.append(now)
+        self.creates_by_address[address] = recent
 
     def _capability(self, role: str, session: str, expires_at: float) -> str:
         return issue_capability(
@@ -150,11 +189,7 @@ class SessionApi:
 
     def _mint_access(self, *, session: str, expires_at: float) -> str:
         now = time.time()
-        self.tokens = [
-            entry
-            for entry in self.tokens
-            if float(entry.get("expires_at") or 0) > now
-        ]
+        self._prune_expired(now)
         token = secrets.token_urlsafe(32)
         self.tokens.append(
             {
@@ -172,15 +207,10 @@ class SessionApi:
             return None
         wanted_hash = _token_hash(value)
         now = time.time()
+        self._prune_expired(now)
         for entry in self.tokens:
             stored_hash = str(entry.get("hash") or "")
-            legacy_value = str(entry.get("value") or "")
-            matches = (
-                bool(stored_hash) and hmac.compare_digest(stored_hash, wanted_hash)
-            ) or (
-                bool(legacy_value) and hmac.compare_digest(legacy_value, value)
-            )
-            if matches and float(entry.get("expires_at") or 0) > now:
+            if stored_hash and hmac.compare_digest(stored_hash, wanted_hash):
                 return entry
         return None
 
@@ -269,6 +299,7 @@ class SessionApi:
         )
 
     async def register(self, request: web.Request) -> web.Response:
+        self._prune_expired()
         try:
             body = await request.json()
         except Exception as exc:
@@ -475,6 +506,7 @@ class SessionApi:
 
     async def robots(self, _request: web.Request) -> web.Response:
         now = time.time()
+        self._prune_expired(now)
         robots = [
             {
                 "session": item["session"],
@@ -488,11 +520,13 @@ class SessionApi:
 
     async def health(self, _request: web.Request) -> web.Response:
         now = time.time()
+        self._prune_expired(now)
         active = sum(self._active(item, now) for item in self.followers.values())
         return web.json_response({"ok": True, "active_followers": active})
 
     def app(self) -> web.Application:
         app = web.Application(client_max_size=128 * 1024)
+        app.cleanup_ctx.append(self._cleanup_context)
         app.router.add_post("/api/follower/create", self.create_follower)
         app.router.add_post("/api/follower/register", self.register)
         app.router.add_get("/api/media/authorize", self.media_authorize)
@@ -504,6 +538,20 @@ class SessionApi:
         app.router.add_post("/test_event", self.browser_event)
         app.router.add_get("/healthz", self.health)
         return app
+
+    async def _cleanup_context(self, _app: web.Application):
+        async def cleanup_loop() -> None:
+            while True:
+                await asyncio.sleep(60)
+                self._prune_expired()
+
+        task = asyncio.create_task(cleanup_loop())
+        yield
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def main() -> None:

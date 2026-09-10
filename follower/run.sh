@@ -10,20 +10,18 @@ if [ ! -x "$PYTHON_BIN" ]; then
   exit 1
 fi
 
-# Preserve the prior log + trajectory CSV so we have forensics when a session
-# crashes, and so each run's data isn't clobbered by the next.
+# Preserve prior logs so we have forensics when a session crashes and each
+# run's data isn't clobbered by the next.
 LOG_DIR="${PHONE_ARM_LOG_DIR:-$HOME/phone_arm_logs}"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/teleop.log"
-TRAJ="$LOG_DIR/teleop_trajectory.csv"
 METRICS="$LOG_DIR/system_metrics.csv"
 WHIPINTO_LOG="$LOG_DIR/whipinto.log"
 WHIP_FFMPEG_LOG="$LOG_DIR/whip_ffmpeg.log"
 VIDEO_SUPERVISOR_LOG="$LOG_DIR/video_supervisor.log"
-export PHONE_ARM_TRAJECTORY_CSV="${PHONE_ARM_TRAJECTORY_CSV:-$TRAJ}"
 export PHONE_ARM_RUN_ID="${PHONE_ARM_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 export PHONE_ARM_RECORDING_DIR="$PWD/teleop_recordings/runs/$PHONE_ARM_RUN_ID"
-for path in "$LOG" "$PHONE_ARM_TRAJECTORY_CSV" "$METRICS" \
+for path in "$LOG" "$METRICS" \
             "$WHIPINTO_LOG" "$WHIP_FFMPEG_LOG" "$VIDEO_SUPERVISOR_LOG"; do
   if [ -f "$path" ]; then
     ts=$(date -r "$path" +%Y%m%d_%H%M%S 2>/dev/null || date +%Y%m%d_%H%M%S)
@@ -226,7 +224,7 @@ export PHONE_ARM_HOSTED_API_URL="${PHONE_ARM_HOSTED_API_URL:-https://188-166-154
 
 # Select the camera before creating the hosted session so the browser knows
 # whether it should start video at all. Stable /dev/v4l/by-path devices are
-# preferred by follower.gateway; arbitrary additional index-0 cameras are also
+# preferred by follower.cameras; arbitrary additional index-0 cameras are also
 # included. The final menu item deliberately disables video.
 SELECTED_VIDEO_DEVICE=""
 if [ -n "${PHONE_ARM_WHIP_INPUT_ARGS:-}" ]; then
@@ -235,8 +233,8 @@ if [ -n "${PHONE_ARM_WHIP_INPUT_ARGS:-}" ]; then
 else
   mapfile -t CAMERA_ROWS < <(
     "$PYTHON_BIN" -c \
-      'from follower.gateway import _present_cameras
-for key, label, path in _present_cameras():
+      'from follower.cameras import present_cameras
+for key, label, path in present_cameras():
     print(f"CAMERA\t{key}\t{label}\t{path}")' \
       2>/dev/null | sed -n '/^CAMERA\t/p'
   )
@@ -372,8 +370,8 @@ trap _cleanup EXIT
 "$PYTHON_BIN" -u -m follower.hosted_api heartbeat --state "$SESSION_STATE" &
 HOSTED_API_PID=$!
 
-# follower.main records per-frame phone / desired-EE / measured-EE to
-# $PHONE_ARM_TRAJECTORY_CSV.
+# follower.main records aligned pose and trajectory data under
+# $PHONE_ARM_RECORDING_DIR.
 # Tee output so the user sees it AND it lands in $LOG.
 set +e
 "$PYTHON_BIN" -u -m follower.main "$@" 2>&1 | tee "$LOG"

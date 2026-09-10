@@ -150,9 +150,6 @@ def _derive_joint_limits(robot) -> None:
             limits[motor] = (-half_deg, half_deg)
     _JOINT_LIMITS_DEG = limits
 
-# Record phone/desired/actual/IK-promised EE per frame to
-# PHONE_ARM_TRAJECTORY_CSV for offline analysis.
-
 # --- Closed-form turret IK -------------------------------------------------
 # The turret reduces to a determined 3-DOF problem: pan = -azimuth about the pan
 # axis; lift+elbow = a 2-link planar reach to (r, h). No iteration, no QP -> no
@@ -1271,11 +1268,6 @@ class ClosedFormArmIK(RobotActionProcessorStep):
         return action
 
 # --- Trajectory logger -----------------------------------------------------
-_TRAJECTORY = {"phone": [], "ee": [], "desired_ee": [], "ee_from_goal": [],
-               "q_meas": [], "q_goal": []}
-_KEEP_IN_MEMORY_TRAJECTORY = os.environ.get(
-    "PHONE_ARM_IN_MEMORY_TRAJECTORY", "0"
-) == "1"
 _STEP_SIZE = 1.0  # fallback trajectory scaling if no desired EE target is available
 _TRACKING_FEEDBACK_PERIOD_S = 0.1
 _RECORDING_STOP_HOLDOFF_S = 0.75
@@ -1611,19 +1603,6 @@ class _TrajectoryLogger:
                 if (ee_meas is None or phone_pos is None
                         or desired_ee is None or q_obs is None):
                     return out
-                if _KEEP_IN_MEMORY_TRAJECTORY:
-                    _TRAJECTORY["phone"].append(phone_pos.copy())
-                    _TRAJECTORY["ee"].append(ee_meas.copy())
-                    _TRAJECTORY["desired_ee"].append(desired_ee.copy())
-                    _TRAJECTORY["q_meas"].append(q_obs.copy())
-                    _TRAJECTORY["ee_from_goal"].append(
-                        ee_goal[:3, 3].copy()
-                        if ee_goal is not None else np.full(3, np.nan)
-                    )
-                    _TRAJECTORY["q_goal"].append(
-                        q_goal.copy()
-                        if q_goal is not None else np.full(len(self.motor_names), np.nan)
-                    )
                 row = {
                     "t_pi_ms": round(time.time() * 1000.0, 3),
                     "recording_active": int(recording_active),
@@ -1735,52 +1714,6 @@ def _force_disable_torque(robot, *, budget_s: float = 30.0) -> None:
     print(f"[teardown] GIVING UP on disable_torque after {budget_s:.0f}s, "
           f"{attempt} attempts; last err: {last_err}. "
           f"ARM TORQUE MAY STILL BE LATCHED -- power-cycle the motors.")
-
-
-def _save_trajectory_csv(out_path: str | None = None) -> None:
-    if len(_TRAJECTORY["phone"]) < 2:
-        return
-    import csv
-    if out_path is None:
-        out_path = os.environ.get(
-            "PHONE_ARM_TRAJECTORY_CSV",
-            os.path.expanduser("~/phone_arm_logs/teleop_trajectory.csv"),
-        )
-    out_dir = os.path.dirname(out_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    phone = np.array(_TRAJECTORY["phone"])
-    ee = np.array(_TRAJECTORY["ee"])
-    desired = np.array(_TRAJECTORY["desired_ee"])
-    ee_from_goal = (np.array(_TRAJECTORY["ee_from_goal"])
-                    if _TRAJECTORY["ee_from_goal"] else np.full_like(ee, np.nan))
-    qm = np.array(_TRAJECTORY["q_meas"]) if _TRAJECTORY["q_meas"] else None
-    qg = np.array(_TRAJECTORY["q_goal"]) if _TRAJECTORY["q_goal"] else None
-    phone_robot = np.column_stack([-phone[:, 1], phone[:, 0], phone[:, 2]])
-    n = min(len(phone), len(ee_from_goal))
-    jnames = ["pan", "lift", "elbow", "wflex", "wroll", "grip"]
-    njoints = qm.shape[1] if qm is not None else 0
-    jn = jnames[:njoints]
-    with open(out_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "i",
-            "phone_robot_x_m", "phone_robot_y_m", "phone_robot_z_m",
-            "desired_x_m", "desired_y_m", "desired_z_m",
-            "ee_x_m", "ee_y_m", "ee_z_m",
-            "ee_from_goal_x_m", "ee_from_goal_y_m", "ee_from_goal_z_m",
-            *[f"qmeas_{j}_deg" for j in jn],
-            *[f"qgoal_{j}_deg" for j in jn],
-        ])
-        for i in range(n):
-            row = [i, *phone_robot[i].tolist(), *desired[i].tolist(),
-                   *ee[i].tolist(), *ee_from_goal[i].tolist()]
-            if qm is not None and i < len(qm):
-                row += qm[i].tolist()
-            if qg is not None and i < len(qg):
-                row += qg[i].tolist()
-            w.writerow(row)
-    print(f"[trajectory] saved {out_path} ({n} samples, {njoints} joints logged)")
 
 
 # --- Rehome ---------------------------------------------------------------
@@ -2093,7 +2026,6 @@ def main() -> None:
         print(f"\n[FATAL] control loop raised {exc.__class__.__name__}: {exc}")
         traceback.print_exc()
     finally:
-        _save_trajectory_csv()
         s = _BUS_RETRY_STATS
         rate = 100 * s["retries"] / s["calls"] if s["calls"] else 0.0
         print(f"[bus_retry] calls={s['calls']} retries={s['retries']} "

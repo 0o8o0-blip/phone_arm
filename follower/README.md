@@ -4,6 +4,7 @@ Runtime for the physical destination arm:
 
 - `main.py` owns the motor bus, kinematics and control loop.
 - `gateway.py` receives phone or leader input from the hosted relay.
+- `cameras.py` performs lightweight camera discovery during startup.
 - `hardware.py` identifies the configured arm and calibration.
 - `leader_mapping.py` maps leader movement onto follower joint targets.
 - `run.sh` starts the follower and its camera publisher.
@@ -32,7 +33,9 @@ https://188-166-154-201.sslip.io/robot/r_example#access=...
 The invitation secret is after `#`, so it is not included in normal HTTP access
 logs. Anyone with the complete link can control that robot. Sessions are
 unlisted by default; startup asks before publishing the robot in the public
-directory. Multiple followers use independent control and video paths.
+directory. Multiple followers use independent control and video paths. A
+temporary disconnect marks a follower offline but does not delete its session;
+session state is removed only after the advertised session expiry.
 
 Startup also lists every detected camera and a **No camera** option. The chosen
 camera is published for that session. With **No camera**, arm control still

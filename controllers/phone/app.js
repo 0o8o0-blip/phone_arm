@@ -1954,13 +1954,9 @@ function onNativeState(state) {
   }
 }
 
-function startNativeTracking() {
-  if (!nativePoseSupported || nativeTrackingActive) return;
+function beginControllerSession(reason) {
   startBtn.disabled = true;
-  nativeTrackingActive = true;
-  nativeTrackingState = 'starting';
-  nativeFpsWindow = { start: performance.now(), n: 0, fps: 0 };
-  setClientRole('controller', 'arkit_start');
+  setClientRole('controller', reason);
   showLanding(false);
   overlay.classList.add('active');
   resetPoseSourceStats();
@@ -1968,6 +1964,26 @@ function startNativeTracking() {
   startBrowserRuntimeProbes();
   startThermalProbes();
   startControl();
+}
+
+function endControllerSession(reason, nextRole = FORCE_VIEWER ? 'viewer' : 'unknown') {
+  releaseControlClaim(reason);
+  stopPoseSourceStats(reason);
+  stopBrowserRuntimeProbes();
+  stopThermalProbes();
+  stopControl();
+  overlay.classList.remove('active', 'warn', 'bad');
+  showLanding(true);
+  setClientRole(nextRole);
+  startBtn.disabled = false;
+}
+
+function startNativeTracking() {
+  if (!nativePoseSupported || nativeTrackingActive) return;
+  nativeTrackingActive = true;
+  nativeTrackingState = 'starting';
+  nativeFpsWindow = { start: performance.now(), n: 0, fps: 0 };
+  beginControllerSession('arkit_start');
   try {
     nativePoseBridge.setPoseHandler(onNativePose);
     nativePoseBridge.setStateHandler(onNativeState);
@@ -1986,15 +2002,7 @@ function stopNativeTracking(reason = 'native_stop') {
   try { nativePoseBridge.stop(); } catch (_) {}
   nativePoseBridge.setPoseHandler(null);
   nativePoseBridge.setStateHandler(null);
-  releaseControlClaim(reason);
-  stopPoseSourceStats(reason);
-  stopBrowserRuntimeProbes();
-  stopThermalProbes();
-  stopControl();
-  overlay.classList.remove('active', 'warn', 'bad');
-  showLanding(true);
-  setClientRole('unknown');
-  startBtn.disabled = false;
+  endControllerSession(reason, 'unknown');
   nativeTrackingState = 'idle';
   log('ARKit pose source stopped');
 }
@@ -2007,8 +2015,7 @@ async function startXR() {
       domOverlay: { root: overlay },
     });
     xrSession = session;
-    setClientRole('controller', 'xr_start');
-    showLanding(false);
+    beginControllerSession('xr_start');
     // Diagnostic + request for ARCore's frame rate. Restored from commit
     // b1d52ee after a working-tree loss. On regular Android Chrome +
     // ARCore, the WebXR spec permits `supportedFrameRates` to be absent
@@ -2054,13 +2061,6 @@ async function startXR() {
     } catch (e) {
       log(`XR frame-rate diagnostic threw: ${e && e.message || e}`);
     }
-    resetPoseSourceStats();
-    startPoseSourceStats();
-    startBrowserRuntimeProbes();
-    startThermalProbes();
-    overlay.classList.add('active');
-    startControl();
-
     // We must provide a WebGL context to the XR session even if we don't
     // render anything ourselves. Create a hidden canvas.
     //
@@ -2123,13 +2123,8 @@ async function startXR() {
     log(`XR started visState=${session.visibilityState}`);
   } catch (e) {
     log(`XR start failed: ${e.message}`);
-    if (_poseSourceStatsTimer) stopPoseSourceStats('xr_start_failed');
-    releaseControlClaim('xr_start_failed');
-    setClientRole(FORCE_VIEWER ? 'viewer' : 'unknown');
-    stopControl();
-    overlay.classList.remove('active');
-    showLanding(true);
-    startBtn.disabled = false;
+    endControllerSession('xr_start_failed');
+    xrSession = null;
   }
 }
 
@@ -2299,15 +2294,8 @@ function updateBanner(poseValid) {
 }
 
 function onXREnd() {
-  releaseControlClaim('xr_end');
-  stopPoseSourceStats('xr_end');
-  stopBrowserRuntimeProbes();
-  stopThermalProbes();
-  stopControl();
-  overlay.classList.remove('active');
-  showLanding(true);
-  setClientRole(FORCE_VIEWER ? 'viewer' : 'unknown');
-  startBtn.disabled = false;
+  setB1(false, 'xr_end');
+  endControllerSession('xr_end');
   xrSession = null;
   log('XR session ended');
 }

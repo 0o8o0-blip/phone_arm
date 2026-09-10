@@ -29,14 +29,13 @@ try:
         DataReceived,
         H3Event,
         HeadersReceived,
-        WebTransportStreamDataReceived,
     )
     from aioquic.quic.configuration import QuicConfiguration
     from aioquic.quic.events import ProtocolNegotiated, QuicEvent
     from aioquic.tls import SessionTicket
 except ImportError as e:  # pragma: no cover - exercised on hosts without aioquic.
     raise SystemExit(
-        "aioquic is required for the WebTransport probe. "
+        "aioquic is required for the WebTransport relay. "
         "Install python3-aioquic or pip install aioquic."
     ) from e
 
@@ -224,6 +223,7 @@ class ControlPeer:
 @dataclass
 class ControlSession:
     name: str
+    expires_at_s: float
     phone: ControlPeer | None = None
     arm: ControlPeer | None = None
     phone_epoch: int = 0
@@ -235,6 +235,7 @@ class ControlSession:
         return {
             "session": self.name,
             "age_s": round((_now_ms() - self.created_ms) / 1000.0, 1),
+            "expires_at_s": self.expires_at_s,
             "phone_epoch": self.phone_epoch,
             "phone": None if self.phone is None else self.phone.summary(),
             "arm": None if self.arm is None else self.arm.summary(),
@@ -254,22 +255,45 @@ class ControlRelay:
         self.max_datagram_bytes = max_datagram_bytes
         self.sessions: dict[str, ControlSession] = {}
 
-    def authorized(self, role: str, token: str, session: str) -> bool:
-        return verify_capability(
+    def authorize(self, role: str, token: str, session: str) -> float | None:
+        if not verify_capability(
             self.capability_secret,
             token,
             role=role,
             session=session,
-        )
+        ):
+            return None
+        return float(token.split(".", 2)[1])
 
-    def get_session(self, name: str) -> ControlSession:
+    def prune_expired(self, now_s: float | None = None) -> None:
+        current = time.time() if now_s is None else now_s
+        expired = [
+            session
+            for session in self.sessions.values()
+            if session.expires_at_s <= current
+        ]
+        for session in expired:
+            if session.phone is not None:
+                self._close_peer(session.phone, "session expired")
+            if session.arm is not None:
+                self._close_peer(session.arm, "session expired")
+            self.sessions.pop(session.name, None)
+            record_event("session_expired", {"session": session.name})
+
+    def get_session(self, name: str, expires_at_s: float) -> ControlSession:
+        self.prune_expired()
         session = self.sessions.get(name)
         if session is None:
-            session = ControlSession(name=name)
+            session = ControlSession(name=name, expires_at_s=expires_at_s)
             self.sessions[name] = session
+        else:
+            # Different role capabilities can have different lifetimes. Keep
+            # the latest observed expiry and never shorten a resumable session.
+            session.expires_at_s = max(session.expires_at_s, expires_at_s)
         return session
 
     def stats(self) -> dict[str, Any]:
+        self.prune_expired()
         return {
             "sessions": [session.summary() for session in self.sessions.values()],
             "time_ms": round(_now_ms(), 3),
@@ -503,15 +527,13 @@ class WebTransportHandler:
         self.transmit = transmit
         self.accepted = False
         self.closed = False
-        self.mode = "echo"
         self.session: ControlSession | None = None
         self.peer: ControlPeer | None = None
         self.stats_key = f"{id(connection)}:{stream_id}"
         self.rx = 0
         self.tx = 0
 
-    def accept(self, *, mode: str = "echo") -> None:
-        self.mode = mode
+    def accept(self, *, expires_at_s: float) -> None:
         self.accepted = True
         STATS.accepted += 1
         STATS.sessions[self.stats_key] = self
@@ -525,8 +547,7 @@ class WebTransportHandler:
         )
         self.transmit()
         record_event("wt_accept", {"stream_id": self.stream_id, "path": self.path, "client": self.client})
-        if mode == "control":
-            self._activate_control()
+        self._activate_control(expires_at_s)
 
     def reject(self, status: int = 404) -> None:
         self.closed = True
@@ -543,7 +564,7 @@ class WebTransportHandler:
         self.closed = True
         STATS.closed += 1
         STATS.sessions.pop(self.stats_key, None)
-        if self.mode == "control" and CONTROL_RELAY is not None and self.session is not None and self.peer is not None:
+        if CONTROL_RELAY is not None and self.session is not None and self.peer is not None:
             CONTROL_RELAY.detach_peer(self.session, self.peer, reason)
         record_event("wt_close", {
             "stream_id": self.stream_id,
@@ -552,7 +573,7 @@ class WebTransportHandler:
             "tx": self.tx,
         })
 
-    def _activate_control(self) -> None:
+    def _activate_control(self, expires_at_s: float) -> None:
         if CONTROL_RELAY is None:
             self.reject(503)
             return
@@ -565,7 +586,7 @@ class WebTransportHandler:
             addr=self.client,
             send_datagram=self._send_datagram,
         )
-        self.session = CONTROL_RELAY.get_session(session_name)
+        self.session = CONTROL_RELAY.get_session(session_name, expires_at_s)
         self.peer = peer
         CONTROL_RELAY.attach_peer(self.session, peer)
 
@@ -581,17 +602,8 @@ class WebTransportHandler:
         STATS.datagrams_rx += 1
         STATS.bytes_rx += len(data)
         STATS.last_rx_ms = _now_ms()
-        if self.mode == "control":
-            if CONTROL_RELAY is not None and self.session is not None and self.peer is not None:
-                CONTROL_RELAY.handle_datagram(self.session, self.peer, data)
-            return
-        self._send_datagram(data)
-
-    def handle_stream_data(self, event: WebTransportStreamDataReceived) -> None:
-        # Echo reliable stream data too, but pose-control experiments should use
-        # datagrams. This just helps detect browser API shape changes.
-        self.connection._quic.send_stream_data(stream_id=event.stream_id, data=event.data)
-        self.transmit()
+        if CONTROL_RELAY is not None and self.session is not None and self.peer is not None:
+            CONTROL_RELAY.handle_datagram(self.session, self.peer, data)
 
 
 class HttpServerProtocol(QuicConnectionProtocol):
@@ -640,16 +652,15 @@ class HttpServerProtocol(QuicConnectionProtocol):
                     transmit=self.transmit,
                 )
                 self._handlers[event.stream_id] = handler
-                if path == "/wt":
-                    handler.accept()
-                elif path in {"/wt/phone", "/wt/arm"}:
+                if path in {"/wt/phone", "/wt/arm"}:
                     if CONTROL_RELAY is None:
                         handler.reject(503)
                         return
                     role = path.rsplit("/", 1)[-1]
                     token = (query.get("token") or [""])[0]
                     session = (query.get("session") or ["default"])[0]
-                    if not CONTROL_RELAY.authorized(role, token, session):
+                    expires_at_s = CONTROL_RELAY.authorize(role, token, session)
+                    if expires_at_s is None:
                         record_event("wt_unauthorized", {
                             "role": role,
                             "session": (query.get("session") or ["default"])[0],
@@ -657,7 +668,7 @@ class HttpServerProtocol(QuicConnectionProtocol):
                         })
                         handler.reject(401)
                         return
-                    handler.accept(mode="control")
+                    handler.accept(expires_at_s=expires_at_s)
                 else:
                     handler.reject(404)
                 return
@@ -674,8 +685,7 @@ class HttpServerProtocol(QuicConnectionProtocol):
                 event.stream_id,
                 200,
                 (
-                    "phone-arm WebTransport probe/control relay\n"
-                    "echo: /wt\n"
+                    "phone-arm WebTransport control relay\n"
                     "control: /wt/phone?session=default&token=... and /wt/arm?session=default&token=...\n"
                 ),
             )
@@ -683,10 +693,6 @@ class HttpServerProtocol(QuicConnectionProtocol):
             handler = self._handlers.get(event.stream_id)
             if handler is not None and handler.accepted:
                 handler.handle_datagram(event.data)
-        elif isinstance(event, WebTransportStreamDataReceived):
-            handler = self._handlers.get(event.session_id)
-            if handler is not None and handler.accepted:
-                handler.handle_stream_data(event)
         elif isinstance(event, DataReceived) and event.stream_ended:
             handler = self._handlers.get(event.stream_id)
             if handler is not None:
@@ -723,7 +729,18 @@ class SessionTicketStore:
 async def _stats_loop(interval_s: float) -> None:
     while True:
         await asyncio.sleep(interval_s)
-        record_event("stats", STATS.snapshot())
+        details = STATS.snapshot()
+        if CONTROL_RELAY is not None:
+            CONTROL_RELAY.prune_expired()
+            details["control"] = CONTROL_RELAY.stats()
+        record_event("stats", details)
+
+
+async def _expiry_loop() -> None:
+    while True:
+        await asyncio.sleep(60)
+        if CONTROL_RELAY is not None:
+            CONTROL_RELAY.prune_expired()
 
 
 async def main() -> None:
@@ -777,6 +794,7 @@ async def main() -> None:
     })
     if args.stats_interval_s > 0:
         asyncio.create_task(_stats_loop(args.stats_interval_s))
+    asyncio.create_task(_expiry_loop())
     await serve(
         args.host,
         args.port,

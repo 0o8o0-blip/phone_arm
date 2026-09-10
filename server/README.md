@@ -4,7 +4,9 @@ This directory contains optional hosted infrastructure. It is not needed on a
 controller or follower machine when they use an existing hosted relay.
 
 - `relay.py` carries WebTransport datagrams between one controller and
-  one follower in each named session.
+  one follower in each named session. Disconnected peers may resume the same
+  session until its signed expiry; the relay does not delete sessions merely
+  because both peers are temporarily absent.
 - `forwarder.py` is an optional regional edge that forwards controller traffic
   to the main relay.
 - `api.py` creates anonymous robot sessions and exchanges a single invitation
